@@ -2,33 +2,30 @@ mod ax25;
 mod codec;
 mod frame;
 mod history;
+mod keys;
 mod kiss;
 mod link;
+mod londopy;
 mod message;
 mod pat;
 mod receiver;
+mod roster;
 mod sender;
 mod sim;
+mod station;
+mod ui;
 
-use std::error::Error;
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use rand::RngExt;
 
 use ax25::Addr;
-use frame::{Frame, Mode};
-use kiss::KissLink;
-use link::{Channel, Link};
-use receiver::{Output, Receiver};
-use sender::{Delivery, Plan, Progress, State};
-
-// a full AX.25 info field
-const AX25_FRAME_MAX: usize = 256;
+use frame::Mode;
+use roster::Roster;
+use sender::{Progress, State};
+use station::{AX25_FRAME_MAX, Inbox, Outgoing, Radio, Station, unix_now};
 
 #[derive(Parser)]
 #[command(
@@ -44,24 +41,18 @@ struct Cli {
 enum Cmd {
     /// Receive deliveries and write them into Pat's inbox.
     Listen {
-        /// Local callsigns to receive and acknowledge for (comma-separated).
-        #[arg(long = "call", required = true, value_delimiter = ',')]
-        calls: Vec<String>,
-        /// Extra group names to accept, besides the net's own.
-        #[arg(long = "group", value_delimiter = ',')]
-        groups: Vec<String>,
-        /// Pat's mailbox folder. Read from `pat env` if not given.
-        #[arg(long)]
-        mailbox: Option<PathBuf>,
         #[command(flatten)]
-        radio: Radio,
+        inbox: InboxArgs,
+        #[command(flatten)]
+        radio: RadioArgs,
     },
     /// Deliver a message to stations on the net.
     Send {
         /// A B2F message (.b2f), or a plain text file to send as the body.
         file: PathBuf,
         /// Recipient callsigns, or a group name for bulletins (comma-separated).
-        #[arg(long, required = true, value_delimiter = ',')]
+        /// With --roster and no --to, every member.
+        #[arg(long, value_delimiter = ',')]
         to: Vec<String>,
         /// Your callsign.
         #[arg(long)]
@@ -74,7 +65,7 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = ModeArg::Addressed)]
         mode: ModeArg,
         /// Extra symbols in each full pass, as a fraction of the message
-        /// [default: 0.1 addressed, 0.5 bulletin and emergency].
+        /// [default: 0.1 with acknowledgements, 0.5 without].
         #[arg(long)]
         margin: Option<f64>,
         /// Repair rounds, each followed by a status round.
@@ -84,7 +75,7 @@ enum Cmd {
         #[arg(long)]
         ack: bool,
         /// Bulletin and emergency: send this many more full passes.
-        #[arg(long, default_value_t = 0)]
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=10))]
         repeat: u32,
         /// Seconds between repeats.
         #[arg(long, default_value_t = 600)]
@@ -92,15 +83,44 @@ enum Cmd {
         /// Minutes receivers keep the delivery after they last hear it.
         #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u16).range(1..=1440))]
         ttl: u16,
+        /// Sign the announcement with this station's key (see `netcast key`).
+        #[arg(long)]
+        sign: bool,
+        /// The net roster; recipients must be on it.
+        #[arg(long)]
+        roster: Option<PathBuf>,
         #[command(flatten)]
-        radio: Radio,
+        radio: RadioArgs,
+    },
+    /// Run the listener and a web page for sending and watching deliveries.
+    Ui {
+        #[command(flatten)]
+        inbox: InboxArgs,
+        /// A folder of .b2f messages the page can send.
+        #[arg(long)]
+        outbox: Option<PathBuf>,
+        /// Port for the page, on 127.0.0.1.
+        #[arg(long, default_value_t = 8740, value_parser = clap::value_parser!(u16).range(1..))]
+        port: u16,
+        #[command(flatten)]
+        radio: RadioArgs,
+    },
+    /// Make this station's signing key, or show its public half.
+    Key {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// Create and edit a net roster (.londopy).
+    Roster {
+        #[command(subcommand)]
+        cmd: RosterCmd,
     },
     /// Show past deliveries, sent and received.
     Status {
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
-    /// Simulate one net and compare airtime with FLAMP-style and one-session-per-station delivery.
+    /// Simulate one net and compare channel time with FLAMP-style and one-session-per-station delivery.
     Sim {
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=255))]
         receivers: u32,
@@ -127,11 +147,56 @@ enum Cmd {
     },
 }
 
+#[derive(Subcommand)]
+enum RosterCmd {
+    /// Start a roster for a net.
+    New {
+        file: PathBuf,
+        /// The net's group address.
+        #[arg(long)]
+        net: String,
+    },
+    /// Add a member, or a group name with --group. Adding a member again replaces its key.
+    Add {
+        file: PathBuf,
+        name: String,
+        /// The member's public key, as `netcast key` prints it.
+        #[arg(long, conflicts_with = "group")]
+        key: Option<String>,
+        #[arg(long)]
+        group: bool,
+    },
+    /// Take a member or group off the roster.
+    Remove { file: PathBuf, name: String },
+    /// Print what's on the roster.
+    Show { file: PathBuf },
+}
+
 #[derive(Args)]
-struct Radio {
-    /// The net's group address; every station on the net uses the same one.
+struct InboxArgs {
+    /// Local callsigns to receive and acknowledge for (comma-separated).
+    #[arg(long = "call", required = true, value_delimiter = ',')]
+    calls: Vec<String>,
+    /// Extra group names to accept, besides the net's own and the roster's.
+    #[arg(long = "group", value_delimiter = ',')]
+    groups: Vec<String>,
+    /// Pat's mailbox folder. Read from `pat env` if not given.
     #[arg(long)]
-    net: String,
+    mailbox: Option<PathBuf>,
+    /// The net roster: its groups are accepted and its keys checked.
+    #[arg(long)]
+    roster: Option<PathBuf>,
+    /// Only take messages signed by a key on the roster.
+    #[arg(long, requires = "roster")]
+    require_signed: bool,
+}
+
+#[derive(Args)]
+struct RadioArgs {
+    /// The net's group address; every station on the net uses the same one.
+    /// Taken from the roster if not given.
+    #[arg(long)]
+    net: Option<String>,
     /// Direwolf's KISS TCP port.
     #[arg(long, default_value = "127.0.0.1:8001")]
     kiss: String,
@@ -174,20 +239,28 @@ impl From<ModeArg> for Mode {
 }
 
 fn main() {
-    if let Err(e) = run(Cli::parse()) {
-        eprintln!("netcast: {e}");
-        std::process::exit(1);
+    match run(Cli::parse()) {
+        Ok(true) => {}
+        Ok(false) => std::process::exit(1),
+        Err(e) => {
+            eprintln!("netcast: {e:#}");
+            std::process::exit(1);
+        }
     }
 }
 
-fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
+/// False when the command ran but didn't fully succeed, like a station that
+/// never confirmed.
+fn run(cli: Cli) -> Result<bool> {
     match cli.cmd {
-        Cmd::Listen {
-            calls,
-            groups,
-            mailbox,
-            radio,
-        } => listen(calls, groups, mailbox, radio),
+        Cmd::Listen { inbox, radio } => {
+            let roster = load_roster(inbox.roster.as_deref())?;
+            let call = first_call(&inbox)?;
+            let st = station(call, radio, roster.as_ref())?;
+            let inbox = inbox_for(inbox, &st, roster.as_ref())?;
+            st.listen(inbox, None)?;
+            Ok(true)
+        }
         Cmd::Send {
             file,
             to,
@@ -201,31 +274,72 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             repeat,
             interval,
             ttl,
+            sign,
+            roster,
             radio,
         } => {
-            let mode = Mode::from(mode);
-            if ack && mode != Mode::Emergency {
-                return Err("--ack only applies to emergency mode".into());
+            let roster = load_roster(roster.as_deref())?;
+            let from: Addr = from.parse().map_err(anyhow::Error::msg)?;
+            let st = station(from.clone(), radio, roster.as_ref())?;
+            let to = station::recipients(&to, roster.as_ref(), &from)?;
+            let b2f = load_message(&file, &from, &to, subject.as_deref())?;
+            let mut out = Outgoing::new(b2f, to.clone(), Mode::from(mode), ack)?;
+            out.margin = margin.unwrap_or(out.margin);
+            out.rounds = rounds;
+            out.ttl_min = ttl;
+            out.repeats = repeat;
+            out.interval_s = interval;
+            out.sign = sign;
+            let acks = out.acks;
+            let states = st.send(out, print_start, |p| print_progress(&to, p))?;
+            println!("transmission finished");
+            let missing = states.iter().filter(|s| **s != State::Decoded).count();
+            if acks && missing > 0 {
+                eprintln!(
+                    "netcast: {missing} of {} stations did not confirm",
+                    to.len()
+                );
+                return Ok(false);
             }
-            let acks = mode == Mode::Addressed || ack;
-            let default_margin = if mode == Mode::Addressed { 0.1 } else { 0.5 };
-            let opts = SendOpts {
-                mode,
-                ttl,
-                margin: margin.unwrap_or(default_margin),
-                rounds,
-                acks,
-                repeats: if acks { 0 } else { repeat },
-                interval_s: interval,
-            };
-            send(&file, &to, &from, subject.as_deref(), &opts, radio)
+            Ok(true)
+        }
+        Cmd::Ui {
+            inbox,
+            outbox,
+            port,
+            radio,
+        } => {
+            let roster = load_roster(inbox.roster.as_deref())?;
+            let call = first_call(&inbox)?;
+            let st = station(call, radio, roster.as_ref())?;
+            let inbox = inbox_for(inbox, &st, roster.as_ref())?;
+            ui::Ui::new(st, roster, outbox, port).run(inbox)?;
+            Ok(true)
+        }
+        Cmd::Key { state_dir } => {
+            let dir = state_dir.unwrap_or_else(history::default_dir);
+            let existed = keys::load(&dir)?.is_some();
+            let key = keys::load_or_create(&dir)?;
+            let public = keys::hex(key.verifying_key().as_bytes());
+            if !existed {
+                println!("made a new key in {}", keys::key_path(&dir).display());
+            }
+            println!("public key: {public}");
+            println!(
+                "add it to the net roster with: netcast roster add <roster> <your call> --key {public}"
+            );
+            Ok(true)
+        }
+        Cmd::Roster { cmd } => {
+            roster_cmd(cmd)?;
+            Ok(true)
         }
         Cmd::Status { state_dir } => {
             print!(
                 "{}",
                 history::report(&state_dir.unwrap_or_else(history::default_dir))?
             );
-            Ok(())
+            Ok(true)
         }
         Cmd::Sim {
             receivers,
@@ -239,11 +353,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             seed,
         } => {
             if !(0.0..=10.0).contains(&margin) {
-                return Err(format!("--margin {margin} is out of range (0 to 10)").into());
+                bail!("--margin {margin} is out of range (0 to 10)");
             }
-            let losses = spread(&loss, receivers as usize)?;
             let cfg = sim::Config {
-                losses,
+                losses: spread(&loss, receivers as usize)?,
                 body_bytes: bytes,
                 baud,
                 txdelay_ms: txdelay,
@@ -255,92 +368,117 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 seed,
             };
             print_sim(&cfg, &loss, &sim::simulate(&cfg));
-            Ok(())
+            Ok(true)
         }
     }
 }
 
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+fn load_roster(path: Option<&Path>) -> Result<Option<Roster>> {
+    path.map(Roster::load).transpose()
 }
 
-fn addrs(list: &[String]) -> Result<Vec<Addr>, String> {
-    list.iter().map(|s| s.parse()).collect()
+fn first_call(inbox: &InboxArgs) -> Result<Addr> {
+    let first = inbox
+        .calls
+        .first()
+        .ok_or_else(|| anyhow!("give at least one --call"))?;
+    first.parse().map_err(anyhow::Error::msg)
 }
 
-struct SendOpts {
-    mode: Mode,
-    ttl: u16,
-    margin: f64,
-    rounds: u32,
-    acks: bool,
-    repeats: u32,
-    interval_s: u64,
+fn station(call: Addr, radio: RadioArgs, roster: Option<&Roster>) -> Result<Station> {
+    let net = match (&radio.net, roster) {
+        (Some(n), _) => n.parse().map_err(anyhow::Error::msg)?,
+        (None, Some(r)) => r.net.parse().map_err(anyhow::Error::msg)?,
+        (None, None) => bail!("give the net's address with --net, or a --roster"),
+    };
+    let dir = radio.state_dir.unwrap_or_else(history::default_dir);
+    // only signing needs the key, so a damaged key file mustn't stop anything else
+    let key = keys::load(&dir).unwrap_or_else(|e| {
+        eprintln!("netcast: not using the station key: {e:#}");
+        None
+    });
+    Ok(Station {
+        call,
+        net,
+        radio: Radio {
+            kiss: radio.kiss,
+            baud: radio.baud,
+            txdelay_ms: radio.txdelay,
+            guard_ms: radio.guard,
+        },
+        dir,
+        key,
+    })
 }
 
-fn load_message(
-    file: &Path,
-    from: &Addr,
-    to: &[String],
-    subject: Option<&str>,
-) -> Result<Vec<u8>, Box<dyn Error>> {
-    let bytes = fs::read(file).map_err(|e| format!("can't read {}: {e}", file.display()))?;
+fn inbox_for(args: InboxArgs, st: &Station, roster: Option<&Roster>) -> Result<Inbox> {
+    let calls = args
+        .calls
+        .iter()
+        .map(|c| c.parse())
+        .collect::<Result<Vec<Addr>, String>>()
+        .map_err(anyhow::Error::msg)?;
+    let mut groups = vec![st.net.to_string()];
+    for g in &args.groups {
+        let a: Addr = g.parse().map_err(anyhow::Error::msg)?;
+        groups.push(a.to_string());
+    }
+    if let Some(r) = roster {
+        groups.extend(r.groups.iter().cloned());
+    }
+    let keys = roster.map(Roster::keys).unwrap_or_default();
+    if args.require_signed && keys.is_empty() {
+        bail!("--require-signed needs a roster with members' keys in it");
+    }
+    let mailbox = match args.mailbox {
+        Some(m) => m,
+        None => pat::mailbox()?,
+    };
+    Ok(Inbox {
+        calls,
+        groups,
+        mailbox,
+        keys,
+        require_signed: args.require_signed,
+    })
+}
+
+fn load_message(file: &Path, from: &Addr, to: &[String], subject: Option<&str>) -> Result<Vec<u8>> {
+    let bytes = fs::read(file).with_context(|| format!("can't read {}", file.display()))?;
     let why = match message::check(&bytes) {
         Ok(_) => return Ok(bytes),
         Err(why) => why,
     };
     let Some(subject) = subject else {
-        return Err(format!(
+        bail!(
             "{} is not a usable B2F message ({why}); pass --subject to send it as a plain text body",
             file.display()
-        )
-        .into());
+        );
     };
     let body = String::from_utf8(bytes)
-        .map_err(|_| format!("{} is neither B2F nor UTF-8 text", file.display()))?;
+        .map_err(|_| anyhow!("{} is neither B2F nor UTF-8 text", file.display()))?;
     Ok(message::compose(&from.to_string(), to, subject, &body, unix_now()).1)
 }
 
-fn send(
-    file: &Path,
-    to: &[String],
-    from: &str,
-    subject: Option<&str>,
-    o: &SendOpts,
-    radio: Radio,
-) -> Result<(), Box<dyn Error>> {
-    let from: Addr = from.parse()?;
-    let net: Addr = radio.net.parse()?;
-    let to: Vec<String> = addrs(to)?.iter().map(Addr::to_string).collect();
-    if !(0.0..=10.0).contains(&o.margin) {
-        return Err(format!("--margin {} is out of range (0 to 10)", o.margin).into());
-    }
-    let msg = load_message(file, &from, &to, subject)?;
-    let id = rand::rng().random_range(1..=u32::MAX);
-    let d = Delivery::new(id, &msg, to.clone(), o.mode, o.ttl, AX25_FRAME_MAX)?;
-
-    let ch = Channel::new(radio.baud, radio.txdelay);
-    let plan = Plan {
-        margin: o.margin,
-        rounds: o.rounds,
-        acks: o.acks,
-        repeats: o.repeats,
-        repeat_gap_ms: o.interval_s * 1000,
-        slot_ms: sender::slot_ms(&ch, radio.guard),
-        guard_ms: radio.guard,
+fn print_start(d: &sender::Delivery) {
+    let signed = if d.announce.signature.is_some() {
+        ", signed"
+    } else {
+        ""
     };
-    let mut link = KissLink::connect(&radio.kiss, from, net, ch, Instant::now())?;
     println!(
-        "delivery {id:08x}: {} ({}), {} bytes compressed in {} symbols, to {}",
+        "delivery {:08x}: {} ({}{signed}), {} bytes compressed in {} symbols, to {}",
+        d.id,
         d.announce.mid,
-        o.mode.name(),
+        d.announce.mode.name(),
         d.announce.oti.transfer_length(),
         d.k(),
-        to.join(", ")
+        d.announce.recipients.join(", ")
     );
-    let states = sender::run(&mut link, &d, &plan, |p| match p {
+}
+
+fn print_progress(to: &[String], p: Progress) {
+    match p {
         Progress::Pass { symbols } => println!("queued the announcement and {symbols} symbols"),
         Progress::Status { round, states } => {
             let list: Vec<String> = to
@@ -350,180 +488,68 @@ fn send(
                 .collect();
             println!("status round {round}: {}", list.join(", "));
         }
-    })?;
-    println!("transmission finished");
+    }
+}
 
-    let outcome: Vec<(String, String)> = if o.acks {
-        to.iter()
-            .cloned()
-            .zip(states.iter().map(|s| s.to_string()))
-            .collect()
-    } else {
-        to.iter().map(|c| (c.clone(), "sent".to_string())).collect()
-    };
-    let dir = radio.state_dir.unwrap_or_else(history::default_dir);
-    history::record_sent(
-        &dir,
-        unix_now(),
-        id,
-        &d.announce.mid,
-        o.mode.name(),
-        &outcome,
-    )?;
-    let missing = states.iter().filter(|s| **s != State::Decoded).count();
-    if o.acks && missing > 0 {
-        return Err(format!("{missing} of {} stations did not confirm", to.len()).into());
+fn roster_cmd(cmd: RosterCmd) -> Result<()> {
+    let addr = |s: &str| -> Result<Addr> { s.parse().map_err(anyhow::Error::msg) };
+    match cmd {
+        RosterCmd::New { file, net } => {
+            if file.exists() {
+                bail!("{} already exists", file.display());
+            }
+            Roster::new(&addr(&net)?).save(&file)?;
+            println!("made {}", file.display());
+        }
+        RosterCmd::Add {
+            file,
+            name,
+            key,
+            group,
+        } => {
+            let mut r = Roster::load(&file)?;
+            let name = addr(&name)?;
+            if group {
+                r.add_group(&name)?;
+            } else {
+                let key = key.as_deref().map(keys::parse_public).transpose()?;
+                r.add_member(&name, key.as_ref())?;
+            }
+            r.save(&file)?;
+            println!("added {name} to {}", file.display());
+        }
+        RosterCmd::Remove { file, name } => {
+            let mut r = Roster::load(&file)?;
+            let name = addr(&name)?;
+            if !r.remove(&name) {
+                bail!("{name} isn't on {}", file.display());
+            }
+            r.save(&file)?;
+            println!("removed {name} from {}", file.display());
+        }
+        RosterCmd::Show { file } => {
+            let r = Roster::load(&file)?;
+            println!("net {}", r.net);
+            if !r.groups.is_empty() {
+                println!("groups {}", r.groups.join(", "));
+            }
+            for m in &r.members {
+                match &m.key {
+                    Some(k) => println!("  {:<9}  key {}", m.call, k),
+                    None => println!("  {:<9}  no key", m.call),
+                }
+            }
+            if r.members.is_empty() {
+                println!("  no members yet");
+            }
+        }
     }
     Ok(())
 }
 
-fn listen(
-    calls: Vec<String>,
-    groups: Vec<String>,
-    mailbox: Option<PathBuf>,
-    radio: Radio,
-) -> Result<(), Box<dyn Error>> {
-    let calls = addrs(&calls)?;
-    let net: Addr = radio.net.parse()?;
-    let mut groups: Vec<String> = addrs(&groups)?.iter().map(Addr::to_string).collect();
-    groups.push(net.to_string());
-    let mailbox = match mailbox {
-        Some(m) => m,
-        None => pat::mailbox()?,
-    };
-    let dir = radio.state_dir.unwrap_or_else(history::default_dir);
-    let names: Vec<String> = calls.iter().map(Addr::to_string).collect();
-    let mut rx = Receiver::new(names.clone(), groups);
-    let now_unix = unix_now();
-    for r in history::unexpired(&dir, now_unix)? {
-        rx.remember(r.id, r.acks, (r.expires_unix - now_unix) * 1000);
-    }
-    println!(
-        "listening on {} as {}, writing to {}",
-        net,
-        names.join(", "),
-        mailbox.display()
-    );
-    let mut station = Listener {
-        rx,
-        due: vec![],
-        mailbox,
-        dir,
-    };
-    // one clock for every connection, since the receiver keeps times across them
-    let start = Instant::now();
-    let mut backoff = RETRY_MIN;
-    loop {
-        let ch = Channel::new(radio.baud, radio.txdelay);
-        match KissLink::connect(&radio.kiss, calls[0].clone(), net.clone(), ch, start) {
-            Ok(mut link) => {
-                backoff = RETRY_MIN;
-                println!("connected to the TNC at {}", radio.kiss);
-                if let Err(e) = station.serve(&mut link) {
-                    eprintln!("lost the KISS connection: {e}");
-                }
-            }
-            Err(e) => {
-                eprintln!("{e}; trying again in {} s", backoff.as_secs());
-                thread::sleep(backoff);
-                backoff = (backoff * 2).min(RETRY_MAX);
-            }
-        }
-    }
-}
-
-const RETRY_MIN: Duration = Duration::from_secs(5);
-const RETRY_MAX: Duration = Duration::from_secs(60);
-
-struct Listener {
-    rx: Receiver,
-    due: Vec<(u64, Frame)>,
-    mailbox: PathBuf,
-    dir: PathBuf,
-}
-
-impl Listener {
-    /// Runs until the link fails.
-    fn serve(&mut self, link: &mut KissLink) -> io::Result<()> {
-        loop {
-            let next = self
-                .due
-                .iter()
-                .map(|(t, _)| *t)
-                .min()
-                .unwrap_or(link.now_ms() + 1000);
-            if let Some(bytes) = link.recv_until(next)?
-                && let Some(f) = Frame::parse(&bytes)
-            {
-                let now = link.now_ms();
-                for out in self.rx.handle(f, now) {
-                    self.on_output(out, now);
-                }
-            }
-            let now = link.now_ms();
-            let (ready, later) = std::mem::take(&mut self.due)
-                .into_iter()
-                .partition(|(t, _)| *t <= now);
-            self.due = later;
-            for (_, f) in ready {
-                if let Frame::Report { id, need, .. } = &f {
-                    match need {
-                        None => println!("delivery {id:08x}: reported decoded"),
-                        Some(n) => println!("delivery {id:08x}: reported need {n}"),
-                    }
-                }
-                link.send(&f.encode())?;
-            }
-            self.rx.expire(now);
-        }
-    }
-
-    fn on_output(&mut self, out: Output, now: u64) {
-        match out {
-            Output::Announced { id, mode, mid, k } => {
-                println!("delivery {id:08x}: {mid} ({}), {k} symbols", mode.name());
-            }
-            Output::Report { at_ms, frame } => self.due.push((at_ms, frame)),
-            Output::Decoded(d) => {
-                for call in &d.calls {
-                    match pat::deliver(&self.mailbox, call, &d.mid, &d.b2f) {
-                        Ok(Some(path)) => println!("decoded {}, wrote {}", d.mid, path.display()),
-                        Ok(None) => println!("decoded {}, already in {call}'s inbox", d.mid),
-                        Err(e) => {
-                            // not stored means not decoded: receive it again rather than ack it
-                            eprintln!("can't write {} into {call}'s inbox: {e}", d.mid);
-                            self.rx.forget(d.id);
-                            return;
-                        }
-                    }
-                }
-                let r = history::Received {
-                    id: d.id,
-                    expires_unix: unix_now() + d.expires_ms.saturating_sub(now) / 1000,
-                    acks: d.acks,
-                };
-                let logged = history::record_received(
-                    &self.dir,
-                    unix_now(),
-                    &d.mid,
-                    d.mode.name(),
-                    &d.calls,
-                    &r,
-                );
-                if let Err(e) = logged {
-                    eprintln!(
-                        "can't write the received log in {}: {e}",
-                        self.dir.display()
-                    );
-                }
-            }
-            Output::Failed { id, why } => println!("delivery {id:08x}: {why}"),
-        }
-    }
-}
-fn spread(loss: &str, n: usize) -> Result<Vec<f64>, String> {
+fn spread(loss: &str, n: usize) -> Result<Vec<f64>> {
     let bad =
-        || format!("--loss {loss:?}: give a rate up to 0.9 like 0.2, or a range like 0.05:0.3");
+        || anyhow!("--loss {loss:?}: give a rate up to 0.9 like 0.2, or a range like 0.05:0.3");
     let parse = |s: &str| {
         s.parse::<f64>()
             .ok()
@@ -531,7 +557,7 @@ fn spread(loss: &str, n: usize) -> Result<Vec<f64>, String> {
             .ok_or_else(bad)
     };
     if n == 0 {
-        return Err("--receivers must be at least 1".into());
+        bail!("--receivers must be at least 1");
     }
     let (lo, hi) = match loss.split_once(':') {
         Some((a, b)) => (parse(a)?, parse(b)?),

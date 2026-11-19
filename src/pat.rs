@@ -33,21 +33,49 @@ fn parse_env(text: &str) -> Option<PathBuf> {
     (!v.is_empty()).then(|| PathBuf::from(v))
 }
 
+#[derive(Debug, PartialEq)]
+pub enum Stored {
+    New(PathBuf),
+    /// Pat already has this message.
+    Already,
+    /// A different message with the same MID is there, and was left alone.
+    Clash,
+}
+
 /// Writes `<MID>.b2f` into `call`'s inbox, marked unread the way Pat marks mail it
-/// receives. Returns `None` if Pat already has that message, which is how duplicates
-/// are dropped. `b2f` must have passed `message::check`.
-pub fn deliver(mailbox: &Path, call: &str, mid: &str, b2f: &[u8]) -> io::Result<Option<PathBuf>> {
+/// receives. A message already there with the same MID is a duplicate if its body
+/// matches (Pat rewrites the headers when mail is read), and is only replaced when
+/// `replace` is set. `b2f` must have passed `message::check`.
+pub fn deliver(
+    mailbox: &Path,
+    call: &str,
+    mid: &str,
+    b2f: &[u8],
+    replace: bool,
+) -> io::Result<Stored> {
     let dir = mailbox.join(call).join("in");
     fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{mid}.b2f"));
     if path.exists() {
-        return Ok(None);
+        if body(&fs::read(&path)?) == body(b2f) {
+            return Ok(Stored::Already);
+        }
+        if !replace {
+            return Ok(Stored::Clash);
+        }
     }
     // write beside it first so Pat never reads half a message
     let part = dir.join(format!("{mid}.b2f.part"));
     fs::write(&part, unread(b2f))?;
     fs::rename(&part, &path)?;
-    Ok(Some(path))
+    Ok(Stored::New(path))
+}
+
+fn body(b2f: &[u8]) -> &[u8] {
+    match b2f.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(end) => &b2f[end + 4..],
+        None => b2f,
+    }
 }
 
 fn unread(b2f: &[u8]) -> Vec<u8> {
@@ -84,23 +112,26 @@ mod tests {
     fn writes_into_inbox_once() {
         let tmp = tempfile::tempdir().unwrap();
         let msg = b"Mid: ABC123\r\nBody: 2\r\n\r\nhi";
-        let first = deliver(tmp.path(), "K1ABC", "ABC123", msg).unwrap();
+        let first = deliver(tmp.path(), "K1ABC", "ABC123", msg, false).unwrap();
         let expected = tmp.path().join("K1ABC").join("in").join("ABC123.b2f");
-        assert_eq!(first, Some(expected.clone()));
+        assert_eq!(first, Stored::New(expected.clone()));
         let stored = b"Mid: ABC123\r\nBody: 2\r\nX-Unread: true\r\n\r\nhi";
         assert_eq!(fs::read(&expected).unwrap(), stored);
         assert_eq!(crate::message::check(stored), Ok("ABC123".into()));
-        assert_eq!(
-            deliver(
-                tmp.path(),
-                "K1ABC",
-                "ABC123",
-                b"Mid: ABC123\r\nBody: 0\r\n\r\n"
-            )
-            .unwrap(),
-            None
-        );
-        assert_eq!(fs::read(&expected).unwrap(), stored);
         assert_eq!(fs::read_dir(expected.parent().unwrap()).unwrap().count(), 1);
+
+        // read in Pat since: headers rewritten, same body
+        fs::write(&expected, b"Body: 2\r\nMid: ABC123\r\n\r\nhi").unwrap();
+        let again = deliver(tmp.path(), "K1ABC", "ABC123", msg, false).unwrap();
+        assert_eq!(again, Stored::Already);
+
+        let squatter = b"Mid: ABC123\r\nBody: 3\r\n\r\nbad";
+        fs::write(&expected, squatter).unwrap();
+        let clash = deliver(tmp.path(), "K1ABC", "ABC123", msg, false).unwrap();
+        assert_eq!(clash, Stored::Clash);
+        assert_eq!(fs::read(&expected).unwrap(), squatter);
+        let replaced = deliver(tmp.path(), "K1ABC", "ABC123", msg, true).unwrap();
+        assert_eq!(replaced, Stored::New(expected.clone()));
+        assert_eq!(fs::read(&expected).unwrap(), stored);
     }
 }
