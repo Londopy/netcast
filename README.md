@@ -64,6 +64,10 @@ timers. Run `netcast sim --help` to try other nets.
 - Decoded messages land in Pat's inbox as ordinary `.b2f` files, so they show up in Pat with no
   change to Pat
 - Addressed, bulletin and emergency modes
+- A web page on the station for composing, picking recipients from the roster, and watching
+  each station's state live
+- A net roster file that net control shares ahead of time, with members, groups and keys
+- Optional Ed25519 signatures, so stations can tell a message really came from net control
 - Works over Direwolf's KISS port today, using plain AX.25 UI frames at 1200 or 9600 baud
 - The on-air format is published in [docs/protocol.md](docs/protocol.md)
 
@@ -107,17 +111,79 @@ itself when Direwolf restarts, and decoded messages show up in Pat as unread.
 | Option | Default | What it does |
 |---|---|---|
 | `--mode` | `addressed` | `addressed`, `bulletin` or `emergency` |
-| `--margin` | 0.1, or 0.5 without acks | extra repair symbols in each full pass, as a fraction of K |
+| `--margin` | 0.1 with acks, 0.5 without | extra repair symbols in each full pass, as a fraction of K |
 | `--rounds` | 3 | repair rounds, each followed by a status round |
 | `--ack` | off | ask for acknowledgements on an emergency message |
 | `--repeat`, `--interval` | 0, 600 s | extra full passes for bulletins, and the gap between them |
 | `--ttl` | 60 min | how long receivers keep a delivery after they last hear it, up to 24 hours |
 | `--kiss` | `127.0.0.1:8001` | Direwolf's KISS TCP port |
 | `--guard` | 500 ms | slack added to each report slot |
+| `--sign` | off | sign the announcement with this station's key |
+| `--roster` | none | the net roster: recipients must be on it, and `--to` defaults to every member |
 
 Each station's Direwolf waits for a clear channel before it answers, which can push its reply
 past its slot. The sender allows for replies that run late, but on a busy channel a station can
 still be marked silent for a round. If that keeps happening, raise `--guard`.
+
+## The net roster
+
+Net control keeps a roster of the net and shares it with every station before the net. It is
+a `.londopy` file, the format all Londopy apps share: a zip with a small manifest and a
+`roster.toml` inside.
+
+```text
+netcast roster new net1.londopy --net NET1
+netcast roster add net1.londopy N0NCS --key <the public key `netcast key` printed>
+netcast roster add net1.londopy K1ABC
+netcast roster add net1.londopy ARES --group
+netcast roster show net1.londopy
+```
+
+With `--roster`, a listener also accepts the roster's group names, and checks signatures
+against its keys. `send --roster` refuses names that aren't on it, and sends to every member
+when you don't give `--to`. With a roster, `--net` can be left out.
+
+## Signing
+
+Signing is optional and off by default. A signed message is still readable by anyone on the
+air: the signature only proves who sent it. We found no FCC ruling on signatures in amateur
+traffic. A signature doesn't hide the meaning of a message, which is what 97.113(a)(4) is about.
+
+```text
+netcast key
+```
+
+This makes the station's key pair, keeps the private half in netcast's folder
+(`%LOCALAPPDATA%\netcast\station.key` on Windows), and prints the public half for the roster.
+Then add `--sign` to `send`, or tick the box on the web page. If you point `--state-dir`
+somewhere else, make sure only you can read that folder.
+
+Receivers mark each message `verified`, `unsigned`, or `signed, key not in roster`. A message
+whose signature doesn't match the roster key for its sender is dropped. Start a listener with
+`--require-signed` to take only verified messages.
+
+`verified` means a station on the roster sent the delivery. It doesn't vouch for the `From:`
+line inside the message (the listener notes when the two differ), and it doesn't cover the
+status reports, which anyone on frequency could fake. The exact rules are in
+[docs/protocol.md](docs/protocol.md).
+
+## The web page
+
+```text
+netcast ui --call N0NCS --roster net1.londopy --outbox C:\netcast\outbox
+```
+
+Then open <http://127.0.0.1:8740/>. The page runs the listener too, so it shows what's
+coming in as well as what you're sending:
+
+- write a message, or pick a `.b2f` from the `--outbox` folder
+- choose recipients from the roster
+- watch each station's state through the status rounds
+- see incoming messages with their progress and whether they're verified
+
+The page only answers on 127.0.0.1. It can make the radio transmit, so it refuses requests
+that don't name it as the host, and every request that sends must carry a token that only the
+page itself knows. Another website open in the same browser can't send through it.
 
 ## Which mode to use
 
@@ -157,8 +223,8 @@ cargo test
 
 ## Not there yet
 
-- The local web UI, the net roster file and Ed25519 signatures
 - ardopcf FEC mode, and `ofm`'s connectionless port
+- Opening `.londopy` rosters by double-clicking them in Explorer, which comes with the installer
 - Winlink Express inboxes, since Express keeps its own message store
 
 ## Patents
@@ -184,6 +250,12 @@ src/
   pat.rs        Pat mailbox lookup and inbox writes
   message.rs    B2F parsing and composing
   history.rs    the sent and received logs
+  station.rs    sending and listening, shared by the CLI and the web page
+  ui.rs         the web page's server and API
+  keys.rs       the station key and announcement signatures
+  roster.rs     the net roster
+  londopy.rs    reading and writing .londopy files
+ui/             the web page: HTML, CSS and JS, built into the binary
 docs/
   protocol.md   the on-air format
 ```

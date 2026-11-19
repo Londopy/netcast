@@ -70,19 +70,79 @@ Announcement layout:
 |---|---|
 | 1 | codec, 1 = brotli + RaptorQ |
 | 12 | RFC 6330 OTI for the message object (transfer length, symbol size, blocks, sub-blocks, alignment) |
+| 32 | SHA-256 of the message object (the compressed message) |
 | 1 | mode: 1 addressed, 2 bulletin, 3 emergency |
 | 2 | TTL in minutes: how long receivers keep this delivery after they last hear it (receivers cap it at 24 hours) |
+| 1 + n | sender's callsign: a length byte, then n ASCII bytes |
 | 1 + n | MID: a length byte, then n ASCII bytes (1 to 12 letters and digits, not a Windows device name such as `NUL` or `COM1`) |
 | 1 | recipient count, 1 to 255 |
-| per recipient, 1 + n | a length byte, then the callsign or group name in ASCII |
+| per recipient, 1 + n | a length byte, then the callsign or group name |
 | 1 | signature length: 0, or 64 for an Ed25519 signature |
 | 0 or 64 | signature |
 
-Netcast v1 always sends signature length 0. Receivers skip a 64-byte signature without checking
-it. Checking signatures comes in a later version, with the net roster.
+Callsigns and group names are 1 to 9 characters: upper-case ASCII letters, digits and
+hyphens. Receivers drop an announcement with anything else in them, or with bytes left over
+at the end.
 
 The sender sends the announcement before the first symbol of every pass, and again before every
-20th symbol frame, so a station that tunes in late still learns what it is hearing.
+20th symbol frame, so a station that tunes in late still learns what it is hearing. Without
+status rounds (bulletins, and emergency messages without acknowledgements) it also sends it
+after the last symbol of each pass. A station that missed the first copy still has the symbols
+it heard, and decodes as soon as this one arrives.
+
+### Signatures
+
+The signature is optional. It is an Ed25519 signature (RFC 8032) over these bytes:
+
+1. the 19 ASCII characters `netcast announce v1`, then a zero byte (20 bytes in all)
+2. the delivery ID, 4 bytes
+3. the announcement, from the codec byte through the last recipient: everything except the
+   signature length and the signature
+
+The announcement carries the hash of the message, so the signature covers the message as well.
+The delivery ID is part of what's signed, so a signed announcement can't be replayed under a
+different delivery. A signature hides nothing: the announcement is readable by anyone, as before.
+
+A receiver looks up the sender's callsign in its net roster:
+
+- **No signature:** the delivery is `unsigned`.
+- **The roster has a key for the sender and the signature checks out:** `verified`.
+- **The roster has a key and the signature doesn't check out:** the receiver drops the delivery.
+- **The roster has no key for the sender:** `signed, key not in roster`.
+
+A station run with `--require-signed` takes only `verified` deliveries and stays silent for the
+rest. A receiver also ignores deliveries whose sender is one of its own callsigns.
+
+An announcement a receiver doesn't take, because it isn't addressed to the station or fails the
+signature rules, doesn't settle the delivery. The receiver notes it and keeps listening, so an
+announcement forged under a real delivery's ID can't shut out the real one. It does stop
+keeping that delivery's symbols until an announcement it takes arrives.
+
+Once a delivery has decoded, the receiver refuses its ID for 7 days, so a recording played back
+later doesn't land again as a new message.
+
+What a signature doesn't cover:
+
+- The B2F `From:` header. The signature says which station sent the delivery; the message
+  inside can still claim to be from someone else, for example when relaying. Receivers note
+  the difference when the two don't match.
+- Status requests and reports. Anyone on frequency can send one, so a forged report can make
+  net control believe a station decoded when it didn't. Treat the status table as a guide, not
+  as a receipt.
+
+Known answer, for checking an implementation. Signing key seed: 32 bytes of `0x01`, delivery ID
+`0x01020304`, and an addressed announcement from `N0NCS` to `K1ABC`, MID `ABC123`, TTL 60, the
+hash 32 bytes of `0x01`, and an OTI for 1000 bytes in symbols of 244:
+
+```text
+public key 8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c
+body       0100000003e80000f401000104010101010101010101010101010101010101010101010101
+           010101010101010101003c054e304e435306414243313233 01054b31414243
+signature  c031e185fa51601ced1672303a51c0652d57f4efc863a98d66cf0b83a2a3164bc612b7dd
+           3208d83f2e8dfbedd0f92f0d2a34196b3b52afc892cadaef732d9804
+```
+
+The lines are wrapped for reading; join them without spaces.
 
 ## Type 2: symbol
 
@@ -157,8 +217,8 @@ stations that missed all of it.
 
 ## Receiving
 
-When the message object decodes, the receiver decompresses it. It checks the result the way
-Pat's parser will read it:
+When the message object decodes, the receiver first checks it against the SHA-256 in the
+announcement. Then it decompresses it, and checks the result the way Pat's parser will read it:
 - the headers are `Key: value` lines
 - `Body:` and every `File:` size is a whole number
 - the sections fill the rest of the message exactly
