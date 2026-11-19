@@ -1,0 +1,20 @@
+[package]
+name = "netcast"
+version = "0.1.0"
+edition = "2024"
+authors = ["Londopy"]
+description = "One-to-many Winlink message delivery for packet radio nets, using RaptorQ fountain codes"
+license = "Apache-2.0"
+repository = "https://github.com/Londopy/netcast"
+homepage = "https://github.com/Londopy/netcast"
+readme = "README.md"
+publish = false
+
+[dependencies]
+brotli = "9.1.3"
+clap = { version = "4.6.8", features = ["derive"] }
+rand = "0.10.4"
+raptorq = "2.0.1"
+
+[dev-dependencies]
+tempfile = "3.27.0"
