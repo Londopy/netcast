@@ -1,8 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+use ed25519_dalek::VerifyingKey;
 
 use crate::codec::{self, Assembly};
 use crate::frame::{Announce, CODEC_BROTLI_RAPTORQ, Frame, Mode};
-use crate::message;
+use crate::{keys, message};
 
 // how long to hold symbols for a delivery whose announcement hasn't decoded yet
 const UNANNOUNCED_TTL_MS: u64 = 30 * 60_000;
@@ -15,13 +17,36 @@ const MAX_SLOT_MS: u16 = 10_000;
 /// A recipient-list index this station acknowledges for, and the callsign it stands for.
 pub type Ack = (u8, String);
 
+type Accepted = (Announce, Trust, Vec<String>, Vec<Ack>);
+
+/// What a station can say about who sent a delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trust {
+    Unsigned,
+    Verified,
+    /// Signed, but the sender's key isn't in this station's roster.
+    UnknownKey,
+}
+
+impl Trust {
+    pub fn name(self) -> &'static str {
+        match self {
+            Trust::Unsigned => "unsigned",
+            Trust::Verified => "verified",
+            Trust::UnknownKey => "signed, key not in roster",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum Output {
     Announced {
         id: u32,
         mode: Mode,
+        from: String,
         mid: String,
         k: u32,
+        trust: Trust,
     },
     Report {
         at_ms: u64,
@@ -39,6 +64,8 @@ pub struct Decoded {
     pub id: u32,
     pub mid: String,
     pub mode: Mode,
+    pub from: String,
+    pub trust: Trust,
     /// Local callsigns whose inbox gets the message.
     pub calls: Vec<String>,
     pub b2f: Vec<u8>,
@@ -49,12 +76,17 @@ pub struct Decoded {
 }
 
 enum State {
+    /// Collecting the announcement. One that isn't for us, or doesn't pass the
+    /// signature check, is remembered by hash and the wait goes on: a forged
+    /// announcement under the same id mustn't lock out the real one.
     Waiting {
         announce: Option<(u16, usize, Assembly)>,
         pending: Vec<(u32, Vec<u8>)>,
+        rejected: Vec<[u8; 32]>,
     },
     Receiving {
-        announce: Announce,
+        announce: Box<Announce>,
+        trust: Trust,
         calls: Vec<String>,
         acks: Vec<Ack>,
         payload: Assembly,
@@ -62,7 +94,14 @@ enum State {
     Done {
         acks: Vec<Ack>,
     },
-    Ignored,
+}
+
+fn waiting() -> State {
+    State::Waiting {
+        announce: None,
+        pending: vec![],
+        rejected: vec![],
+    }
 }
 
 struct Delivery {
@@ -87,7 +126,11 @@ impl Delivery {
 pub struct Receiver {
     calls: Vec<String>,
     groups: Vec<String>,
+    keys: HashMap<String, VerifyingKey>,
+    require_signed: bool,
     deliveries: HashMap<u32, Delivery>,
+    /// Deliveries decoded lately, so a recording played back later is ignored.
+    seen: HashSet<u32>,
 }
 
 impl Receiver {
@@ -95,7 +138,35 @@ impl Receiver {
         Receiver {
             calls,
             groups,
+            keys: HashMap::new(),
+            require_signed: false,
             deliveries: HashMap::new(),
+            seen: HashSet::new(),
+        }
+    }
+
+    /// Marks a delivery as already decoded, so it's never taken again.
+    pub fn seen(&mut self, id: u32) {
+        self.seen.insert(id);
+    }
+
+    /// Senders' public keys by callsign, and whether to refuse anything not
+    /// verified against them.
+    pub fn trusting(
+        mut self,
+        keys: HashMap<String, VerifyingKey>,
+        require_signed: bool,
+    ) -> Receiver {
+        self.keys = keys;
+        self.require_signed = require_signed;
+        self
+    }
+
+    /// Symbols held and needed for a delivery still being received.
+    pub fn progress(&self, id: u32) -> Option<(u32, u32)> {
+        match &self.deliveries.get(&id)?.state {
+            State::Receiving { payload, .. } => Some((payload.have(), payload.k())),
+            _ => None,
         }
     }
 
@@ -108,6 +179,7 @@ impl Receiver {
     /// Drops a delivery entirely, so it is received again from scratch.
     pub fn forget(&mut self, id: u32) {
         self.deliveries.remove(&id);
+        self.seen.remove(&id);
     }
 
     pub fn expire(&mut self, now_ms: u64) {
@@ -117,16 +189,15 @@ impl Receiver {
     pub fn handle(&mut self, frame: Frame, now_ms: u64) -> Vec<Output> {
         let id = frame.id();
         let known = self.deliveries.contains_key(&id);
+        if !known && self.seen.contains(&id) {
+            return vec![];
+        }
         match frame {
             Frame::Announce { .. } | Frame::Symbol { .. } if !known => {
                 if !self.make_room() {
                     return vec![];
                 }
-                let state = State::Waiting {
-                    announce: None,
-                    pending: vec![],
-                };
-                let d = Delivery::new(state, now_ms, UNANNOUNCED_TTL_MS);
+                let d = Delivery::new(waiting(), now_ms, UNANNOUNCED_TTL_MS);
                 self.deliveries.insert(id, d);
             }
             Frame::Report { .. } => return vec![],
@@ -156,24 +227,23 @@ impl Receiver {
         if self.deliveries.len() < MAX_DELIVERIES {
             return true;
         }
-        let victim = self
-            .deliveries
-            .iter()
-            .find(|(_, d)| matches!(d.state, State::Ignored))
-            .map(|(id, _)| *id)
-            .or_else(|| {
-                self.deliveries
-                    .iter()
-                    .filter(|(_, d)| matches!(d.state, State::Waiting { .. }))
-                    .min_by_key(|(_, d)| d.expires_ms)
-                    .map(|(id, _)| *id)
-            });
+        let waiting = |d: &&Delivery, foreign: bool| matches!(&d.state, State::Waiting { rejected, .. } if !foreign || !rejected.is_empty());
+        let victim = [true, false].into_iter().find_map(|foreign| {
+            self.deliveries
+                .iter()
+                .filter(|(_, d)| waiting(d, foreign))
+                .min_by_key(|(_, d)| d.expires_ms)
+                .map(|(id, _)| *id)
+        });
         victim.map(|id| self.deliveries.remove(&id)).is_some()
     }
 
     fn on_announce(&mut self, id: u32, esi: u32, len: u16, symbol: Vec<u8>) -> Vec<Output> {
         let d = self.deliveries.get_mut(&id).expect("delivery exists");
-        let State::Waiting { announce, pending } = &mut d.state else {
+        let State::Waiting {
+            announce, rejected, ..
+        } = &mut d.state
+        else {
             return vec![];
         };
         if announce.is_none() {
@@ -186,32 +256,50 @@ impl Receiver {
         if *want_len != len || *want_t != symbol.len() || !asm.add(esi, symbol) {
             return vec![];
         }
-        let Some(a) = Announce::parse(asm.result().expect("just decoded")) else {
-            // a bad symbol got in; start the announcement over and keep the payload symbols
-            *announce = None;
-            return vec![];
-        };
-        let pending = std::mem::take(pending);
-        d.state = State::Ignored;
-        if a.codec != CODEC_BROTLI_RAPTORQ {
+        let body = asm.result().expect("just decoded").to_vec();
+        *announce = None;
+        let hash = codec::hash(&body);
+        if rejected.contains(&hash) {
             return vec![];
         }
+        let verdict = match Announce::parse(&body) {
+            Some(a) => self.accept(id, a),
+            None => Err(None),
+        };
+        let d = self.deliveries.get_mut(&id).expect("delivery exists");
+        let State::Waiting {
+            pending, rejected, ..
+        } = &mut d.state
+        else {
+            unreachable!("still waiting")
+        };
+        let (a, trust, calls, acks) = match verdict {
+            Ok(v) => v,
+            Err(why) => {
+                // stop collecting symbols for something that isn't ours; if the real
+                // announcement turns up, repair rounds make up the difference
+                rejected.push(hash);
+                pending.clear();
+                return why
+                    .map(|why| Output::Failed { id, why })
+                    .into_iter()
+                    .collect();
+            }
+        };
+        let pending = std::mem::take(pending);
         d.ttl_ms = (a.ttl_min as u64 * 60_000).min(MAX_TTL_MS);
-        let Some((calls, acks)) = self.addressed_to_us(&a) else {
-            return vec![];
-        };
-        let Some(payload) = Assembly::new(a.oti) else {
-            return vec![];
-        };
+        let payload = Assembly::new(a.oti).expect("checked in accept");
         let mut out = vec![Output::Announced {
             id,
             mode: a.mode,
+            from: a.from.clone(),
             mid: a.mid.clone(),
             k: payload.k(),
+            trust,
         }];
-        let d = self.deliveries.get_mut(&id).expect("delivery exists");
         d.state = State::Receiving {
-            announce: a,
+            announce: Box::new(a),
+            trust,
             calls,
             acks,
             payload,
@@ -222,6 +310,38 @@ impl Receiver {
         out
     }
 
+    /// Whether to receive this delivery. A refusal worth telling the operator
+    /// about carries a reason.
+    fn accept(&self, id: u32, a: Announce) -> Result<Accepted, Option<String>> {
+        if a.codec != CODEC_BROTLI_RAPTORQ || Assembly::new(a.oti).is_none() {
+            return Err(None);
+        }
+        // our own transmissions can come back through a shared TNC or a digipeater
+        if self.calls.contains(&a.from) {
+            return Err(None);
+        }
+        let (calls, acks) = self.addressed_to_us(&a).ok_or(None)?;
+        let trust = match (&a.signature, self.keys.get(&a.from)) {
+            (None, _) => Trust::Unsigned,
+            (Some(_), Some(key)) if keys::verify(&a, id, key) => Trust::Verified,
+            (Some(_), Some(_)) => {
+                return Err(Some(format!(
+                    "{} claims to be from {}, but the signature doesn't match its roster key",
+                    a.mid, a.from
+                )));
+            }
+            (Some(_), None) => Trust::UnknownKey,
+        };
+        if self.require_signed && trust != Trust::Verified {
+            return Err(Some(format!(
+                "{} from {} is {}; this station only takes verified messages",
+                a.mid,
+                a.from,
+                trust.name()
+            )));
+        }
+        Ok((a, trust, calls, acks))
+    }
     /// Which local calls the message is for, and which list entries we acknowledge for.
     /// Groups get the message into every local inbox but never acknowledge.
     fn addressed_to_us(&self, a: &Announce) -> Option<(Vec<String>, Vec<Ack>)> {
@@ -243,8 +363,10 @@ impl Receiver {
     fn on_symbol(&mut self, id: u32, esi: u32, data: Vec<u8>) -> Vec<Output> {
         let d = self.deliveries.get_mut(&id).expect("delivery exists");
         match &mut d.state {
-            State::Waiting { pending, .. } => {
-                if pending.len() < MAX_PENDING {
+            State::Waiting {
+                pending, rejected, ..
+            } => {
+                if rejected.is_empty() && pending.len() < MAX_PENDING {
                     pending.push((esi, data));
                 }
                 vec![]
@@ -256,7 +378,7 @@ impl Receiver {
                     vec![]
                 }
             }
-            State::Done { .. } | State::Ignored => vec![],
+            State::Done { .. } => vec![],
         }
     }
 
@@ -264,6 +386,7 @@ impl Receiver {
         let d = self.deliveries.get_mut(&id).expect("delivery exists");
         let State::Receiving {
             announce,
+            trust,
             calls,
             acks,
             payload,
@@ -271,16 +394,20 @@ impl Receiver {
         else {
             unreachable!("finish is only called while receiving")
         };
-        let checked = codec::decompress(payload.result().expect("decoded"))
-            .map_err(|e| format!("decoded but did not decompress: {e}"))
-            .and_then(|b2f| match message::check(&b2f) {
-                Ok(mid) if mid == announce.mid => Ok(b2f),
-                Ok(mid) => Err(format!(
-                    "message MID {mid} does not match announced {}",
-                    announce.mid
-                )),
-                Err(why) => Err(format!("not a message Pat can read: {why}")),
-            });
+        let packed = payload.result().expect("decoded");
+        let checked = if codec::hash(packed) != announce.hash {
+            Err("decoded data doesn't match the announced hash".to_string())
+        } else {
+            codec::decompress(packed).map_err(|e| format!("decoded but did not decompress: {e}"))
+        };
+        let checked = checked.and_then(|b2f| match message::check(&b2f) {
+            Ok(mid) if mid == announce.mid => Ok(b2f),
+            Ok(mid) => Err(format!(
+                "message MID {mid} does not match announced {}",
+                announce.mid
+            )),
+            Err(why) => Err(format!("not a message Pat can read: {why}")),
+        });
         let b2f = match checked {
             Ok(b) => b,
             Err(why) => {
@@ -293,6 +420,8 @@ impl Receiver {
             id,
             mid: announce.mid.clone(),
             mode: announce.mode,
+            from: announce.from.clone(),
+            trust: *trust,
             calls: std::mem::take(calls),
             b2f,
             acks: acks.clone(),
@@ -301,6 +430,7 @@ impl Receiver {
         d.state = State::Done {
             acks: std::mem::take(acks),
         };
+        self.seen.insert(id);
         Output::Decoded(out)
     }
 
@@ -323,7 +453,7 @@ impl Receiver {
             State::Done { acks } => (acks, None),
             _ => return vec![],
         };
-        let out = acks
+        let out: Vec<Output> = acks
             .iter()
             .filter(|(i, _)| polled.get(*i as usize) == Some(&true))
             .map(|(i, _)| {
@@ -339,7 +469,10 @@ impl Receiver {
                 }
             })
             .collect();
-        d.answered = Some(round);
+        // a request that polled none of us mustn't use up the round
+        if !out.is_empty() {
+            d.answered = Some(round);
+        }
         out
     }
 }
@@ -348,7 +481,8 @@ impl Receiver {
 mod tests {
     use super::*;
     use crate::link::Link;
-    use crate::sender::{self, Delivery, Plan};
+    use crate::sender::{self, Delivery, Envelope, Plan};
+    use ed25519_dalek::SigningKey;
 
     /// Records what the sender transmits; nobody ever answers.
     struct Tape(Vec<Frame>);
@@ -370,9 +504,24 @@ mod tests {
     }
 
     fn frames(to: &[&str], mode: Mode, margin: f64) -> (Vec<Frame>, Vec<u8>) {
+        signed_frames(to, mode, margin, None)
+    }
+
+    fn signed_frames(
+        to: &[&str],
+        mode: Mode,
+        margin: f64,
+        key: Option<&ed25519_dalek::SigningKey>,
+    ) -> (Vec<Frame>, Vec<u8>) {
         let to: Vec<String> = to.iter().map(|s| s.to_string()).collect();
         let (_, msg) = message::compose("N0NCS", &to, "test", "hello net", 0);
-        let d = Delivery::new(77, &msg, to, mode, 60, 256).unwrap();
+        let env = Envelope {
+            from: "N0NCS".into(),
+            recipients: to,
+            mode,
+            ttl_min: 60,
+        };
+        let d = Delivery::new(77, &msg, env, 256, key).unwrap();
         let plan = Plan {
             margin,
             rounds: 0,
@@ -467,7 +616,10 @@ mod tests {
             data: vec![0x55; data.len()],
         };
         let out = feed(&mut rx, &[f[0].clone(), forged]);
-        assert!(matches!(out.last(), Some(Output::Failed { .. })), "{out:?}");
+        assert!(
+            matches!(out.last(), Some(Output::Failed { why, .. }) if why.contains("hash")),
+            "{out:?}"
+        );
         let repair: Vec<Frame> = symbols.cloned().collect();
         let out = feed(&mut rx, &repair);
         let Some(Output::Decoded(d)) = out.into_iter().find(|o| matches!(o, Output::Decoded(_)))
@@ -504,5 +656,152 @@ mod tests {
         assert_eq!(rx.handle(status(2, vec![true]), 100 * 60_000).len(), 1);
         rx.expire(200 * 60_000);
         assert!(rx.handle(status(3, vec![true]), 200 * 60_000).is_empty());
+    }
+
+    fn decoded(out: Vec<Output>) -> Option<Decoded> {
+        out.into_iter().find_map(|o| match o {
+            Output::Decoded(d) => Some(d),
+            _ => None,
+        })
+    }
+
+    fn roster_with(key: &SigningKey) -> HashMap<String, VerifyingKey> {
+        HashMap::from([("N0NCS".to_string(), key.verifying_key())])
+    }
+
+    #[test]
+    fn signatures_are_checked_against_the_roster() {
+        let ncs = SigningKey::from_bytes(&[1; 32]);
+        let impostor = SigningKey::from_bytes(&[2; 32]);
+        let calls = || vec!["K1ABC".to_string()];
+
+        let (f, msg) = signed_frames(&["K1ABC"], Mode::Addressed, 0.0, Some(&ncs));
+        let mut rx = Receiver::new(calls(), vec![]).trusting(roster_with(&ncs), false);
+        let d = decoded(feed(&mut rx, &f)).expect("verified message decodes");
+        assert_eq!((d.trust, d.b2f), (Trust::Verified, msg));
+
+        let mut rx = Receiver::new(calls(), vec![]).trusting(HashMap::new(), false);
+        let d = decoded(feed(&mut rx, &f)).expect("unknown key still decodes");
+        assert_eq!(d.trust, Trust::UnknownKey);
+
+        let (forged, _) = signed_frames(&["K1ABC"], Mode::Addressed, 0.0, Some(&impostor));
+        let mut rx = Receiver::new(calls(), vec![]).trusting(roster_with(&ncs), false);
+        let out = feed(&mut rx, &forged);
+        assert!(matches!(out[..], [Output::Failed { .. }]), "{out:?}");
+        assert!(rx.handle(status(1, vec![true]), 0).is_empty());
+    }
+
+    #[test]
+    fn require_signed_refuses_anything_unverified() {
+        let ncs = SigningKey::from_bytes(&[1; 32]);
+        let calls = || vec!["K1ABC".to_string()];
+        let (unsigned, _) = frames(&["K1ABC"], Mode::Addressed, 0.0);
+        let mut rx = Receiver::new(calls(), vec![]).trusting(roster_with(&ncs), true);
+        assert!(decoded(feed(&mut rx, &unsigned)).is_none());
+
+        let (signed, _) = signed_frames(&["K1ABC"], Mode::Addressed, 0.0, Some(&ncs));
+        let mut rx = Receiver::new(calls(), vec![]).trusting(roster_with(&ncs), true);
+        assert_eq!(
+            decoded(feed(&mut rx, &signed)).unwrap().trust,
+            Trust::Verified
+        );
+    }
+
+    #[test]
+    fn bulletin_survives_a_lost_first_announcement() {
+        let (f, msg) = frames(&["NET1"], Mode::Bulletin, 0.5);
+        assert!(matches!(f.last(), Some(Frame::Announce { .. })));
+        let mut rx = Receiver::new(vec!["K1ABC".into()], vec!["NET1".into()]);
+        let d = decoded(feed(&mut rx, &f[1..])).expect("decodes from the closing announcement");
+        assert_eq!(d.b2f, msg);
+    }
+
+    #[test]
+    fn ignores_its_own_deliveries() {
+        let (f, _) = frames(&["NET1"], Mode::Bulletin, 0.0);
+        let mut rx = Receiver::new(vec!["N0NCS".into()], vec!["NET1".into()]);
+        assert!(feed(&mut rx, &f).is_empty());
+    }
+
+    #[test]
+    fn a_forged_announcement_first_does_not_lock_out_the_real_one() {
+        let ncs = SigningKey::from_bytes(&[1; 32]);
+        let (real, msg) = signed_frames(&["K1ABC"], Mode::Addressed, 0.0, Some(&ncs));
+        // same delivery id, sent first: unsigned, and addressed elsewhere
+        let (unsigned, _) = frames(&["K1ABC"], Mode::Addressed, 0.0);
+        let (elsewhere, _) = frames(&["W9ZZZ"], Mode::Addressed, 0.0);
+        for forged in [&unsigned[0], &elsewhere[0]] {
+            let mut rx =
+                Receiver::new(vec!["K1ABC".into()], vec![]).trusting(roster_with(&ncs), true);
+            rx.handle(real[1].clone(), 0);
+            rx.handle(forged.clone(), 0);
+            let d = decoded(feed(&mut rx, &real)).expect("the real announcement still counts");
+            assert_eq!((d.trust, d.b2f), (Trust::Verified, msg.clone()));
+        }
+    }
+
+    #[test]
+    fn refusals_are_reported_once() {
+        let (f, _) = frames(&["K1ABC"], Mode::Addressed, 0.0);
+        let ncs = SigningKey::from_bytes(&[1; 32]);
+        let mut rx = Receiver::new(vec!["K1ABC".into()], vec![]).trusting(roster_with(&ncs), true);
+        let out = feed(&mut rx, &[f[0].clone(), f[0].clone(), f[0].clone()]);
+        assert_eq!(out.len(), 1, "{out:?}");
+    }
+
+    #[test]
+    fn require_signed_refuses_unknown_keys_too() {
+        let ncs = SigningKey::from_bytes(&[1; 32]);
+        let stranger = SigningKey::from_bytes(&[3; 32]);
+        let (f, _) = signed_frames(&["K1ABC"], Mode::Addressed, 0.0, Some(&stranger));
+        let other = HashMap::from([("W2XYZ".to_string(), ncs.verifying_key())]);
+        let mut rx = Receiver::new(vec!["K1ABC".into()], vec![]).trusting(other, true);
+        assert!(decoded(feed(&mut rx, &f)).is_none());
+    }
+
+    #[test]
+    fn a_replayed_delivery_is_ignored_after_it_expires() {
+        let (f, _) = frames(&["K1ABC"], Mode::Addressed, 0.0);
+        let mut rx = Receiver::new(vec!["K1ABC".into()], vec![]);
+        assert!(decoded(feed(&mut rx, &f)).is_some());
+        rx.expire(u64::MAX);
+        assert!(feed(&mut rx, &f).is_empty());
+    }
+
+    #[test]
+    fn a_status_that_polls_nobody_here_does_not_use_up_the_round() {
+        let (f, _) = frames(&["K1ABC", "W2XYZ"], Mode::Addressed, 0.0);
+        let mut rx = Receiver::new(vec!["K1ABC".into()], vec![]);
+        feed(&mut rx, &f[..1]);
+        assert!(rx.handle(status(1, vec![false, true]), 0).is_empty());
+        assert_eq!(rx.handle(status(1, vec![true, true]), 0).len(), 1);
+    }
+
+    #[test]
+    fn ttl_is_capped_at_a_day() {
+        let to = vec!["K1ABC".to_string()];
+        let (_, msg) = message::compose("N0NCS", &to, "test", "hello net", 0);
+        let env = Envelope {
+            from: "N0NCS".into(),
+            recipients: to,
+            mode: Mode::Addressed,
+            ttl_min: u16::MAX,
+        };
+        let d = Delivery::new(77, &msg, env, 256, None).unwrap();
+        let plan = Plan {
+            margin: 0.0,
+            rounds: 0,
+            acks: false,
+            repeats: 0,
+            repeat_gap_ms: 0,
+            slot_ms: 500,
+            guard_ms: 0,
+        };
+        let mut tape = Tape(vec![]);
+        sender::run(&mut tape, &d, &plan, |_| {}).unwrap();
+        let mut rx = Receiver::new(vec!["K1ABC".into()], vec![]);
+        rx.handle(tape.0[0].clone(), 0);
+        rx.expire(MAX_TTL_MS + 1);
+        assert!(rx.handle(status(1, vec![true]), MAX_TTL_MS + 1).is_empty());
     }
 }

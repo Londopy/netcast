@@ -9,7 +9,7 @@ use crate::frame::{Frame, HEADER_LEN, Mode};
 use crate::link::{Channel, Link};
 use crate::message;
 use crate::receiver::{Output, Receiver};
-use crate::sender::{self, Delivery, Plan};
+use crate::sender::{self, Delivery, Envelope, Plan};
 
 // SABM/UA, the B2F proposal and its answer, DISC/UA: each one its own keyed-up frame
 const SESSION_SETUP_FRAMES: u32 = 6;
@@ -165,6 +165,15 @@ fn test_message(body_bytes: usize, n: usize, seed: u64) -> Vec<u8> {
     message::compose("N0NCS", &to, "Simulated bulletin", &body, 0).1
 }
 
+fn envelope(n: usize) -> Envelope {
+    Envelope {
+        from: "N0NCS".into(),
+        recipients: (0..n).map(call).collect(),
+        mode: Mode::Addressed,
+        ttl_min: 60,
+    }
+}
+
 fn plan(cfg: &Config, ch: &Channel) -> Plan {
     Plan {
         margin: cfg.margin,
@@ -189,16 +198,8 @@ pub fn simulate(cfg: &Config) -> Outcome {
     for trial in 0..cfg.trials {
         let seed = cfg.seed + trial as u64;
         let msg = test_message(cfg.body_bytes, n, seed);
-        let to: Vec<String> = (0..n).map(call).collect();
-        let d = Delivery::new(
-            seed as u32 | 1,
-            &msg,
-            to,
-            Mode::Addressed,
-            60,
-            cfg.frame_max,
-        )
-        .expect("simulated message fits");
+        let d = Delivery::new(seed as u32 | 1, &msg, envelope(n), cfg.frame_max, None)
+            .expect("simulated message fits");
         out.compressed = d.announce.oti.transfer_length() as usize;
         out.k = d.k();
 
@@ -336,8 +337,7 @@ mod tests {
     }
 
     fn run(stations: Vec<Station>, msg: &[u8], cfg: &Config) -> (SimLink, Vec<State>) {
-        let to = (0..stations.len()).map(call).collect();
-        let d = Delivery::new(42, msg, to, Mode::Addressed, 60, cfg.frame_max).unwrap();
+        let d = Delivery::new(42, msg, envelope(stations.len()), cfg.frame_max, None).unwrap();
         let mut link = SimLink::new(stations, cfg.baud, cfg.txdelay_ms);
         let p = plan(cfg, &link.channel);
         let states = sender::run(&mut link, &d, &p, |_| {}).unwrap();
@@ -349,8 +349,7 @@ mod tests {
         let cfg = config(vec![0.0; 6]);
         let msg = test_message(2000, 6, 6);
         let stations = (0..6).map(|i| station(i, 0.0, 6)).collect();
-        let to = (0..6).map(call).collect();
-        let d = Delivery::new(42, &msg, to, Mode::Addressed, 60, cfg.frame_max).unwrap();
+        let d = Delivery::new(42, &msg, envelope(6), cfg.frame_max, None).unwrap();
         let mut link = SimLink::new(stations, cfg.baud, cfg.txdelay_ms);
         // every reply a full second behind the model: more than the 500 ms guard
         link.report_delay_ms = 1500;
@@ -433,8 +432,7 @@ mod tests {
             .enumerate()
             .map(|(i, l)| station(i, *l, 5))
             .collect();
-        let to = (0..60).map(call).collect();
-        let d = Delivery::new(9, &msg, to, Mode::Addressed, 60, cfg.frame_max).unwrap();
+        let d = Delivery::new(9, &msg, envelope(60), cfg.frame_max, None).unwrap();
         assert!(d.announce.to_bytes().len() > cfg.frame_max);
         let (link, states) = run(stations, &msg, &cfg);
         assert!(

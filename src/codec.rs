@@ -29,6 +29,11 @@ pub fn decompress(data: &[u8]) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
+pub fn hash(data: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(data).into()
+}
+
 pub fn round_down(n: usize) -> usize {
     n - n % ALIGN as usize
 }
@@ -121,6 +126,10 @@ impl Assembly {
 
     pub fn k(&self) -> u32 {
         self.k
+    }
+
+    pub fn have(&self) -> u32 {
+        self.seen.len() as u32
     }
 
     /// Adds one symbol. Returns true if this symbol finished the object.

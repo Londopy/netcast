@@ -125,12 +125,42 @@ pub fn compose(
     (mid, msg)
 }
 
+/// The first value of a header, if the message has it.
+pub fn header(b2f: &[u8], name: &str) -> Option<String> {
+    let end = b2f.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = String::from_utf8_lossy(&b2f[..end]);
+    head.split("\r\n").find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        k.eq_ignore_ascii_case(name).then(|| v.trim().to_string())
+    })
+}
+
 /// UTC time as `YYYY/MM/DD HH:MM`, the form B2F uses.
 pub fn date(unix: u64) -> String {
-    let days = (unix / 86400) as i64;
+    let (y, m, d) = civil(unix);
     let secs = unix % 86400;
-    // days-to-civil from Howard Hinnant's date algorithms
-    let z = days + 719468;
+    format!(
+        "{y:04}/{m:02}/{d:02} {:02}:{:02}",
+        secs / 3600,
+        secs % 3600 / 60
+    )
+}
+
+/// UTC time as RFC 3339, like `2026-11-19T20:13:00Z`.
+pub fn rfc3339(unix: u64) -> String {
+    let (y, m, d) = civil(unix);
+    let secs = unix % 86400;
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        secs / 3600,
+        secs % 3600 / 60,
+        secs % 60
+    )
+}
+
+// days-to-civil from Howard Hinnant's date algorithms
+fn civil(unix: u64) -> (i64, i64, i64) {
+    let z = (unix / 86400) as i64 + 719468;
     let era = z.div_euclid(146097);
     let doe = z - era * 146097;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
@@ -138,12 +168,7 @@ pub fn date(unix: u64) -> String {
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!(
-        "{y:04}/{m:02}/{d:02} {:02}:{:02}",
-        secs / 3600,
-        secs % 3600 / 60
-    )
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
 }
 
 #[cfg(test)]
@@ -198,5 +223,11 @@ mod tests {
         assert_eq!(date(0), "1970/01/01 00:00");
         assert_eq!(date(1_795_000_000), "2026/11/18 11:06");
         assert_eq!(date(951_782_400), "2000/02/29 00:00");
+        assert_eq!(rfc3339(1_795_000_000), "2026-11-18T11:06:40Z");
+        assert_eq!(
+            header(b"Mid: A\r\nSubject: Net news\r\n\r\n", "subject").as_deref(),
+            Some("Net news")
+        );
+        assert_eq!(header(b"Mid: A\r\n\r\n", "Subject"), None);
     }
 }

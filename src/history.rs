@@ -107,6 +107,19 @@ pub fn unexpired(dir: &Path, now_unix: u64) -> io::Result<Vec<Received>> {
         .collect())
 }
 
+/// Deliveries decoded since `since_unix`, whatever their TTL.
+pub fn decoded_since(dir: &Path, since_unix: u64) -> io::Result<Vec<u32>> {
+    Ok(lines(dir, RECEIVED)?
+        .iter()
+        .filter_map(|l| {
+            let mut f = l.split('\t');
+            let unix: u64 = f.next()?.parse().ok()?;
+            let id = u32::from_str_radix(f.next()?, 16).ok()?;
+            (unix >= since_unix).then_some(id)
+        })
+        .collect())
+}
+
 /// Both logs as readable text, oldest first.
 pub fn report(dir: &Path) -> io::Result<String> {
     let mut out = String::new();
@@ -157,6 +170,8 @@ mod tests {
         };
         record_received(tmp.path(), 100, "MID1", "addressed", &calls, &keep).unwrap();
         record_received(tmp.path(), 100, "MID2", "bulletin", &calls, &old).unwrap();
+        assert_eq!(decoded_since(tmp.path(), 100).unwrap(), vec![0xAB, 0xCD]);
+        assert!(decoded_since(tmp.path(), 101).unwrap().is_empty());
         let back = unexpired(tmp.path(), 1000).unwrap();
         assert_eq!(back.len(), 1);
         assert_eq!((back[0].id, back[0].expires_unix), (0xAB, 2000));

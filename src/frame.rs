@@ -46,25 +46,42 @@ impl Mode {
 pub struct Announce {
     pub codec: u8,
     pub oti: ObjectTransmissionInformation,
+    /// SHA-256 of the compressed message, so a signature covers the message too.
+    pub hash: [u8; 32],
     pub mode: Mode,
     pub ttl_min: u16,
+    pub from: String,
     pub mid: String,
     pub recipients: Vec<String>,
+    pub signature: Option<[u8; 64]>,
 }
 
 impl Announce {
-    pub fn to_bytes(&self) -> Vec<u8> {
+    /// Everything but the signature: the part a signature covers.
+    pub fn body(&self) -> Vec<u8> {
         let mut b = vec![self.codec];
         b.extend_from_slice(&self.oti.serialize());
+        b.extend_from_slice(&self.hash);
         b.push(self.mode as u8);
         b.extend_from_slice(&self.ttl_min.to_be_bytes());
+        push_str(&mut b, &self.from);
         push_str(&mut b, &self.mid);
         b.push(self.recipients.len() as u8);
         for r in &self.recipients {
             push_str(&mut b, r);
         }
-        // signature length; signing comes later, so always none for now
-        b.push(0);
+        b
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut b = self.body();
+        match &self.signature {
+            Some(sig) => {
+                b.push(64);
+                b.extend_from_slice(sig);
+            }
+            None => b.push(0),
+        }
         b
     }
 
@@ -72,25 +89,40 @@ impl Announce {
         let mut r = Reader(b);
         let codec = r.u8()?;
         let oti = ObjectTransmissionInformation::deserialize(r.take(12)?.try_into().ok()?);
+        let hash = r.take(32)?.try_into().ok()?;
         let mode = Mode::from_byte(r.u8()?)?;
         let ttl_min = r.u16()?;
+        let from = r.str().filter(|s| valid_name(s))?;
         let mid = r.str().filter(|m| crate::message::valid_mid(m))?;
         let n = r.u8()?;
-        let recipients = (0..n).map(|_| r.str()).collect::<Option<Vec<_>>>()?;
-        let sig_len = r.u8()? as usize;
-        if sig_len != 0 && sig_len != 64 {
-            return None;
-        }
-        r.take(sig_len)?;
-        Some(Announce {
+        let recipients = (0..n)
+            .map(|_| r.str().filter(|s| valid_name(s)))
+            .collect::<Option<Vec<_>>>()?;
+        let signature = match r.u8()? {
+            0 => None,
+            64 => Some(r.take(64)?.try_into().ok()?),
+            _ => return None,
+        };
+        r.rest().is_empty().then_some(Announce {
             codec,
             oti,
+            hash,
             mode,
             ttl_min,
+            from,
             mid,
             recipients,
+            signature,
         })
     }
+}
+
+/// Callsigns and group names as they travel in an announcement: upper case, so a
+/// name means one thing everywhere, and nothing that could upset a screen or log.
+pub fn valid_name(s: &str) -> bool {
+    (1..=9).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-')
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -296,10 +328,13 @@ mod tests {
         Announce {
             codec: CODEC_BROTLI_RAPTORQ,
             oti: ObjectTransmissionInformation::new(5000, 244, 1, 1, 4),
+            hash: [7; 32],
             mode: Mode::Addressed,
             ttl_min: 60,
+            from: "N0NCS".into(),
             mid: "ABCDEF123456".into(),
             recipients: vec!["K1ABC".into(), "W2XYZ-7".into()],
+            signature: None,
         }
     }
 
@@ -371,7 +406,30 @@ mod tests {
     #[test]
     fn announce_round_trips() {
         let a = announce();
-        assert_eq!(Announce::parse(&a.to_bytes()), Some(a));
+        assert_eq!(Announce::parse(&a.to_bytes()), Some(a.clone()));
+        let signed = Announce {
+            signature: Some([3; 64]),
+            ..a
+        };
+        let b = signed.to_bytes();
+        assert_eq!(b.len(), signed.body().len() + 65);
+        assert_eq!(Announce::parse(&b), Some(signed));
+    }
+
+    #[test]
+    fn announce_names_are_plain() {
+        for bad in ["\u{1b}[2J", "K1 ABC", "", "TOOLONGCALL", "k1abc"] {
+            let a = Announce {
+                from: bad.into(),
+                ..announce()
+            };
+            assert_eq!(Announce::parse(&a.to_bytes()), None, "{bad:?}");
+            let a = Announce {
+                recipients: vec![bad.into()],
+                ..announce()
+            };
+            assert_eq!(Announce::parse(&a.to_bytes()), None, "{bad:?}");
+        }
     }
 
     #[test]

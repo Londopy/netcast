@@ -1,8 +1,11 @@
 use std::fmt;
 use std::io;
 
+use ed25519_dalek::SigningKey;
+
 use crate::codec::{self, Object};
-use crate::frame::{Announce, CODEC_BROTLI_RAPTORQ, Frame, HEADER_LEN, Mode};
+use crate::frame::{Announce, CODEC_BROTLI_RAPTORQ, Frame, HEADER_LEN, Mode, valid_name};
+use crate::keys;
 use crate::link::{Channel, Link, idle};
 
 // a late joiner needs the announcement, so it goes out again this often
@@ -58,6 +61,14 @@ pub fn slot_ms(ch: &Channel, guard_ms: u64) -> u16 {
     (ch.burst_ms(report) + guard_ms).min(u16::MAX as u64) as u16
 }
 
+/// Who a delivery is from and for, and how receivers treat it.
+pub struct Envelope {
+    pub from: String,
+    pub recipients: Vec<String>,
+    pub mode: Mode,
+    pub ttl_min: u16,
+}
+
 /// One message, encoded and ready to go.
 pub struct Delivery {
     pub id: u32,
@@ -69,13 +80,13 @@ pub struct Delivery {
 
 impl Delivery {
     /// `frame_max` is the largest netcast frame the transport carries, header included.
+    /// With a key, the announcement is signed.
     pub fn new(
         id: u32,
         b2f: &[u8],
-        recipients: Vec<String>,
-        mode: Mode,
-        ttl_min: u16,
+        env: Envelope,
         frame_max: usize,
+        key: Option<&SigningKey>,
     ) -> Result<Delivery, String> {
         let mid =
             crate::message::check(b2f).map_err(|e| format!("not a usable B2F message: {e}"))?;
@@ -85,11 +96,15 @@ impl Delivery {
                 b2f.len()
             ));
         }
-        if recipients.is_empty() || recipients.len() > 255 {
-            return Err(format!(
-                "{} recipients; netcast takes 1 to 255",
-                recipients.len()
-            ));
+        let n = env.recipients.len();
+        if n == 0 || n > 255 {
+            return Err(format!("{n} recipients; netcast takes 1 to 255"));
+        }
+        if let Some(bad) = std::iter::once(&env.from)
+            .chain(&env.recipients)
+            .find(|s| !valid_name(s))
+        {
+            return Err(format!("{bad:?} is not a callsign or group name"));
         }
         let packed = codec::compress(b2f);
         let t = codec::round_down(frame_max - HEADER_LEN);
@@ -99,14 +114,20 @@ impl Delivery {
                 packed.len()
             )
         })?;
-        let announce = Announce {
+        let mut announce = Announce {
             codec: CODEC_BROTLI_RAPTORQ,
             oti: payload.oti(),
-            mode,
-            ttl_min,
+            hash: codec::hash(&packed),
+            mode: env.mode,
+            ttl_min: env.ttl_min,
+            from: env.from,
             mid,
-            recipients,
+            recipients: env.recipients,
+            signature: None,
         };
+        if let Some(key) = key {
+            keys::sign(&mut announce, id, key);
+        }
         let body = announce.to_bytes();
         // the announce frame spends 2 bytes on the announcement's length
         let room = frame_max - HEADER_LEN - 2;
@@ -135,6 +156,10 @@ struct Session<'a, L: Link> {
     d: &'a Delivery,
     next_repair: u32,
     announces: u32,
+    /// Without status rounds nothing re-announces later, so each pass ends with
+    /// the announcement too: a station that missed the first one still has its
+    /// symbols waiting and decodes the moment it hears this one.
+    closing_announce: bool,
 }
 
 impl<L: Link> Session<'_, L> {
@@ -180,6 +205,9 @@ impl<L: Link> Session<'_, L> {
                 esi,
                 data,
             })?;
+        }
+        if self.closing_announce {
+            self.announce()?;
         }
         Ok(())
     }
@@ -248,6 +276,7 @@ pub fn run(
         d,
         next_repair: 0,
         announces: 0,
+        closing_announce: !plan.acks,
     };
     let k = d.k();
     let extra = (k as f64 * plan.margin).ceil() as u32;
