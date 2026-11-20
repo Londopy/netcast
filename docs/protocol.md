@@ -245,17 +245,22 @@ can fail to decode with exactly K symbols, and then 1 more is the honest answer.
 A station that hasn't decoded the announcement stays silent, since it doesn't know it is being
 polled. A station answers only for its own callsigns, never for a group name it listens to.
 A station that has decoded a delivery keeps answering `decoded` until the TTL runs out, even
-after a restart, so a lost report never causes extra repair.
+after a restart, so once its answer gets through the sender stops allowing for it.
 
 ## Delivery
 
 1. Initial pass: the announcement, all K source symbols, then ceil(K x margin) repair symbols.
    The default margin is 10% in addressed mode.
-2. Status round: poll every recipient that hasn't reported `decoded`. Anyone who doesn't answer
-   is marked silent for that round.
-3. Repair round: the announcement, then max(need) + 2 fresh repair symbols, where max is taken
-   over this round's reports. If nobody reported a need, only the announcement goes out, for
-   stations that missed it.
+2. Status round: poll every recipient that hasn't reported `decoded`. A station the sender has
+   never heard from during the delivery is silent. One that answered an earlier round but not
+   this one stays receiving.
+3. Repair round: the announcement, then max(short) + 2 fresh repair symbols. A station's short
+   is the need from its latest report. When this round's report is missing, it is the last
+   need less the share of the repair sent since that the station has been hearing:
+   (K - need) / symbols sent, as of its last report. After two missed polls in a row, a
+   station no longer counts, until it answers again. A need is taken as between 1 and K,
+   whatever the report says. If nobody counts, only the announcement goes out, for stations
+   that missed it.
 4. Repeat steps 2 and 3, up to the round limit (default 3 repair rounds), or until every
    recipient has reported `decoded`.
 

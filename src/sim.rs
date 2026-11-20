@@ -52,6 +52,10 @@ struct Station {
     loss: f64,
     rng: StdRng,
     deaf_until_ms: u64,
+    /// Symbol frames this station misses before it starts hearing them.
+    drop_symbols: u32,
+    /// Reports for this round and later never reach the sender.
+    muted_from_round: u8,
     message: Option<Vec<u8>>,
 }
 
@@ -93,8 +97,16 @@ impl Link for SimLink {
             if end < st.deaf_until_ms || st.rng.random_bool(st.loss) {
                 continue;
             }
+            if matches!(frame, Frame::Symbol { .. }) && st.drop_symbols > 0 {
+                st.drop_symbols -= 1;
+                continue;
+            }
             for out in st.rx.handle(frame.clone(), end) {
                 match out {
+                    Output::Report {
+                        frame: Frame::Report { round, .. },
+                        ..
+                    } if round >= st.muted_from_round => {}
                     Output::Report { at_ms, frame } => {
                         let b = frame.encode();
                         let ms = self.channel.burst_ms(b.len());
@@ -142,6 +154,8 @@ fn station(i: usize, loss: f64, seed: u64) -> Station {
         loss,
         rng: StdRng::seed_from_u64(seed.wrapping_mul(1000).wrapping_add(i as u64)),
         deaf_until_ms: 0,
+        drop_symbols: 0,
+        muted_from_round: u8::MAX,
         message: None,
     }
 }
@@ -162,7 +176,12 @@ fn test_message(body_bytes: usize, n: usize, seed: u64) -> Vec<u8> {
         })
         .collect();
     let to: Vec<String> = (0..n).map(call).collect();
-    message::compose("N0NCS", &to, "Simulated bulletin", &body, 0).1
+    let (mid, b2f) = message::compose("N0NCS", &to, "Simulated bulletin", &body, 0);
+    // a MID from the seed, not a random one, so a run compresses to the same
+    // size every time and the results can be checked
+    let b2f = String::from_utf8(b2f).expect("composed messages are ASCII");
+    b2f.replace(&mid, &format!("SIM{:09}", seed % 1_000_000_000))
+        .into_bytes()
 }
 
 fn envelope(n: usize) -> Envelope {
@@ -425,11 +444,15 @@ mod tests {
             .enumerate()
             .map(|(i, l)| station(i, *l, 1))
             .collect();
+        let d = Delivery::new(42, &msg, envelope(8), cfg.frame_max, None).unwrap();
+        let first_pass = d.k() + (d.k() as f64 * cfg.margin).ceil() as u32;
         let (link, _) = run(stations, &msg, &cfg);
         let unique: BTreeSet<_> = link.symbol_esis.iter().collect();
+        // more than one repair round's worth, so later rounds had to pick fresh ESIs too
         assert!(
-            link.symbol_esis.len() > 30,
-            "expected repair rounds to have run"
+            link.symbol_esis.len() as u32 > first_pass + 6,
+            "expected several repair rounds, sent {} after a first pass of {first_pass}",
+            link.symbol_esis.len()
         );
         assert_eq!(unique.len(), link.symbol_esis.len());
     }
@@ -479,6 +502,51 @@ mod tests {
             .collect();
         let (_, states) = run(stations, &msg, &cfg);
         assert_eq!(states, vec![State::Decoded, State::Silent]);
+    }
+
+    #[test]
+    fn a_station_whose_reports_stop_arriving_still_gets_repair() {
+        let cfg = config(vec![0.0]);
+        let msg = test_message(4000, 1, 9);
+        let d = Delivery::new(42, &msg, envelope(1), cfg.frame_max, None).unwrap();
+        let first_pass = d.k() + (d.k() as f64 * cfg.margin).ceil() as u32;
+        let mut st = station(0, 0.0, 9);
+        // misses the whole first pass and some of the first repair, so it is still
+        // short after round 2, and nothing it says after round 1 gets through
+        st.drop_symbols = first_pass + 3;
+        st.muted_from_round = 2;
+        let (link, states) = run(vec![st], &msg, &cfg);
+        assert_eq!(link.stations[0].message.as_deref(), Some(&msg[..]));
+        // heard from once, so it is never written off as silent
+        assert!(
+            matches!(
+                states[0],
+                State::Receiving {
+                    answered: false,
+                    ..
+                }
+            ),
+            "{:?}",
+            states[0]
+        );
+    }
+
+    #[test]
+    fn the_table_shows_stations_still_receiving() {
+        let shown = State::Receiving {
+            need: 4,
+            answered: true,
+        }
+        .to_string();
+        assert_eq!(shown, "receiving (needs 4)");
+        let stale = State::Receiving {
+            need: 4,
+            answered: false,
+        };
+        assert_eq!(
+            stale.to_string(),
+            "receiving (needs 4; no answer last round)"
+        );
     }
 
     #[test]

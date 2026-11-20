@@ -12,12 +12,20 @@ use crate::link::{Channel, Link, idle};
 
 // a late joiner needs the announcement, so it goes out again this often
 const ANNOUNCE_EVERY: usize = 20;
+// repair stops being sized for a station that missed this many polls running
+const MAX_MISSED: u8 = 2;
 
+/// Where one recipient stands, as far as the sender has heard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
+    /// Not asked yet.
     Pending,
-    Need(u16),
+    /// Reported it still needs `need` symbols. `answered` is false when it
+    /// missed the latest poll, so `need` is from an earlier round.
+    Receiving { need: u16, answered: bool },
+    /// Reported decoding the message: its acknowledgement.
     Decoded,
+    /// Polled, and never heard from in this delivery.
     Silent,
 }
 
@@ -25,7 +33,14 @@ impl fmt::Display for State {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             State::Pending => write!(f, "pending"),
-            State::Need(n) => write!(f, "need {n}"),
+            State::Receiving {
+                need,
+                answered: true,
+            } => write!(f, "receiving (needs {need})"),
+            State::Receiving {
+                need,
+                answered: false,
+            } => write!(f, "receiving (needs {need}; no answer last round)"),
             State::Decoded => write!(f, "decoded"),
             State::Silent => write!(f, "silent"),
         }
@@ -279,7 +294,10 @@ impl<L: Link + ?Sized> Session<'_, L> {
                 late = late.max(behind).min(n as u64 * slot);
             }
             heard[i] = true;
-            states[i] = need.map_or(State::Decoded, State::Need);
+            states[i] = need.map_or(State::Decoded, |need| State::Receiving {
+                need,
+                answered: true,
+            });
         }
         if heard.iter().filter(|h| **h).count() == n {
             // everyone answered early; the last one's TNC may still be sending after its
@@ -287,12 +305,84 @@ impl<L: Link + ?Sized> Session<'_, L> {
             let until = self.link.now_ms() + plan.lead_ms as u64;
             idle(self.link, until)?;
         }
-        for (i, s) in states.iter_mut().enumerate() {
-            if polled[i] && !heard[i] {
-                *s = State::Silent;
-            }
+        for (s, _) in states.iter_mut().zip(&heard).filter(|(_, h)| !**h) {
+            // a station heard from before stays receiving: its report may be all
+            // that got lost, so it isn't written off as silent
+            *s = match *s {
+                State::Receiving { need, .. } => State::Receiving {
+                    need,
+                    answered: false,
+                },
+                State::Decoded => State::Decoded,
+                State::Pending | State::Silent => State::Silent,
+            };
         }
         Ok(())
+    }
+}
+
+/// How many symbols each station may still be short, for sizing repair. A
+/// station that answered is short what it said. One whose report went missing
+/// keeps its last figure, less what it probably heard of the repair since, at
+/// the rate it has been hearing the delivery so far. Silent and decoded
+/// stations need nothing sent for them.
+struct Shortfall {
+    k: u32,
+    sent: u32,
+    short: Vec<u32>,
+    rate: Vec<f64>,
+    missed: Vec<u8>,
+}
+
+impl Shortfall {
+    fn new(k: u32, sent: u32, n: usize) -> Shortfall {
+        Shortfall {
+            k,
+            sent,
+            short: vec![0; n],
+            rate: vec![0.0; n],
+            missed: vec![0; n],
+        }
+    }
+
+    fn learn(&mut self, states: &[State]) {
+        for (i, st) in states.iter().enumerate() {
+            match *st {
+                State::Receiving {
+                    need,
+                    answered: true,
+                } => {
+                    // a report says at least 1 until it says decoded, and never more than
+                    // K: one forged report mustn't put hours of repair on the air
+                    let need = (need as u32).clamp(1, self.k);
+                    self.short[i] = need;
+                    self.rate[i] = (self.k - need) as f64 / self.sent as f64;
+                    self.missed[i] = 0;
+                }
+                State::Receiving {
+                    answered: false, ..
+                } => self.missed[i] = self.missed[i].saturating_add(1),
+                State::Pending | State::Decoded | State::Silent => self.short[i] = 0,
+            }
+        }
+    }
+
+    /// max(need) + 2 over the stations known to be short; nothing when there are none.
+    fn want(&self) -> u32 {
+        self.short
+            .iter()
+            .zip(&self.missed)
+            .filter(|(s, m)| **s > 0 && **m < MAX_MISSED)
+            .map(|(s, _)| *s)
+            .max()
+            .map_or(0, |n| n + 2)
+    }
+
+    fn repaired(&mut self, symbols: u32) {
+        self.sent += symbols;
+        for (s, r) in self.short.iter_mut().zip(&self.rate) {
+            *s = s.saturating_sub((symbols as f64 * r).floor() as u32);
+        }
     }
 }
 
@@ -320,7 +410,9 @@ pub fn run(
 
     let mut states = vec![State::Pending; d.announce.recipients.len()];
     if plan.acks {
+        let mut short = Shortfall::new(k, k + extra, states.len());
         s.status(1, plan, &mut states)?;
+        short.learn(&states);
         progress(Progress::Status {
             round: 1,
             states: &states,
@@ -329,15 +421,13 @@ pub fn run(
             if states.iter().all(|s| *s == State::Decoded) {
                 break;
             }
-            let worst = states.iter().filter_map(|s| match s {
-                State::Need(n) => Some(*n as u32),
-                _ => None,
-            });
-            let want = worst.max().map_or(0, |n| n + 2);
+            let want = short.want();
             let repair = s.fresh(want);
             s.pass(repair)?;
             progress(Progress::Pass { symbols: want });
+            short.repaired(want);
             s.status(round, plan, &mut states)?;
+            short.learn(&states);
             progress(Progress::Status {
                 round,
                 states: &states,
@@ -356,4 +446,64 @@ pub fn run(
     idle(s.link, done)?;
     s.link.sign_off()?;
     Ok(states)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn heard(need: u16) -> State {
+        State::Receiving {
+            need,
+            answered: true,
+        }
+    }
+
+    #[test]
+    fn a_lost_report_leaves_what_the_station_probably_missed() {
+        // K = 100, 110 sent; one station heard 55 of them (half), one heard 99
+        let mut s = Shortfall::new(100, 110, 3);
+        s.learn(&[heard(45), heard(1), State::Silent]);
+        assert_eq!(s.want(), 47);
+        s.repaired(47);
+        // neither answers this time
+        let unheard = |need| State::Receiving {
+            need,
+            answered: false,
+        };
+        s.learn(&[unheard(45), unheard(1), State::Silent]);
+        // the half-deaf one probably got about 23 of the 47, the other all of them
+        assert_eq!(s.short, vec![22, 0, 0]);
+        assert_eq!(s.want(), 24);
+        s.learn(&[State::Decoded, State::Decoded, State::Silent]);
+        assert_eq!(s.want(), 0);
+    }
+
+    #[test]
+    fn a_station_unheard_for_two_rounds_is_not_repaired_blind() {
+        let mut s = Shortfall::new(100, 110, 1);
+        s.learn(&[heard(100)]);
+        let unheard = State::Receiving {
+            need: 100,
+            answered: false,
+        };
+        s.repaired(102);
+        s.learn(&[unheard]);
+        assert_eq!(s.want(), 102, "one lost report is still allowed for");
+        s.repaired(102);
+        s.learn(&[unheard]);
+        assert_eq!(s.want(), 0, "two in a row stops the guessing");
+        s.learn(&[heard(7)]);
+        assert_eq!(s.want(), 9, "an answer brings it back");
+    }
+
+    #[test]
+    fn a_report_can_ask_for_at_most_the_whole_message() {
+        let mut s = Shortfall::new(6, 7, 2);
+        // anyone on frequency can send a report; this one claims 65535 missing
+        s.learn(&[heard(u16::MAX), heard(0)]);
+        assert_eq!(s.want(), 6 + 2);
+        s.learn(&[State::Decoded, heard(0)]);
+        assert_eq!(s.want(), 1 + 2, "need 0 isn't decoded");
+    }
 }

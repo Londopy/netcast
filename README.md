@@ -48,9 +48,9 @@ of frames each, at 1200 baud with 300 ms TXDELAY:
 
 | Message | netcast | FLAMP-style hole lists | 20 separate sessions |
 |---|---|---|---|
-| 4 kB body (2.6 kB compressed, 11 symbols) | 99 s | 99 s | 767 s |
+| 4 kB body (2.6 kB compressed, 11 symbols) | 98 s | 99 s | 767 s |
 | 20 kB body (12 kB compressed, 51 symbols) | 219 s | 350 s | 3229 s |
-| 4 kB body, every station at 40% loss | 179 s | 200 s | 1395 s |
+| 4 kB body, every station at 40% loss | 176 s | 200 s | 1395 s |
 
 Every method got the message to all 20 stations in every trial. On short messages the status
 slots cost about as much as the data, so netcast and FLAMP come out even. The gap opens as
@@ -62,11 +62,11 @@ timers. Run `netcast sim --help` to try other nets.
 
 - One transmission of the message for any number of stations, plus repair sized for the worst
   receiver
-- Net control sees each station's state: decoded, how many symbols it still needs, or silent
+- Net control sees each station's state: receiving (with how many symbols it still needs), decoded, or silent
 - Stations that tune in late keep what they hear and decode once the next announcement arrives
 - Decoded messages land in Pat's inbox as ordinary `.b2f` files, so they show up in Pat with no
   change to Pat
-- Addressed, bulletin and emergency modes
+- Addressed, bulletin and emergency modes, and a radiogram-style precedence (routine, welfare, priority, emergency) on every message
 - A web page on the station for composing, picking recipients from the roster, and watching
   each station's state live
 - A net roster file that net control shares ahead of time, with members, groups and keys
@@ -186,9 +186,15 @@ netcast check --call K1ABC --net NET1 --roster net1.londopy
 | `--sign` | off | sign the announcement with this station's key |
 | `--roster` | none | the net roster: recipients must be on it, and `--to` defaults to every member |
 
+After each status round the sender lists every station as `receiving (needs n)`, `decoded` or
+`silent`. A `decoded` report is the station's acknowledgement. `silent` means the sender has
+heard nothing at all from that station during this delivery. A station that answered before
+but whose report didn't arrive this time stays `receiving`, marked `no answer last round`, and
+the next repair still allows for what it may be missing.
+
 Each station's Direwolf waits for a clear channel before it answers, which can push its reply
-past its slot. The sender allows for replies that run late, but on a busy channel a station can
-still be marked silent for a round. If that keeps happening, raise `--guard`.
+past its slot. The sender allows for replies that run late, but on a busy channel a reply can
+still be missed. If that keeps happening, raise `--guard`.
 
 Direwolf's FX.25 or IL2P (`FX25TX` or `IL2PTX` in `direwolf.conf`) adds forward error correction
 to each frame and can rescue frames that would otherwise be lost. Turn it on only if every
@@ -336,9 +342,11 @@ carries the sender's callsign in its AX.25 source address, in clear text.
 The message is compressed with brotli and split into K symbols of 244 bytes, one per UI frame.
 Net control sends an announcement (the MID, the recipient list, and the RaptorQ parameters),
 then all K source symbols, then 10% extra repair symbols. Then it polls the stations: each one
-answers in its own time slot with `decoded` or `need n`. The next pass is max(n) + 2 repair
-symbols that have never been sent before. Each of them helps every station that is still short,
-whatever that station missed. After a few rounds every station has decoded, or the stations
+answers in its own time slot with `decoded` or n, the number of symbols it still needs. The
+next pass is max(n) + 2 repair symbols that have never been sent before. Each of them helps
+every station that is still short, whatever that station missed. When a station's report is
+lost, the sender estimates what it is still missing from its last report and how much of the
+delivery it has been hearing. After a few rounds every station has decoded, or the stations
 that heard nothing at all are marked silent.
 
 Netcast never lets more than about 40 frames queue up in Direwolf, because Direwolf throws
