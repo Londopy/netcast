@@ -6,6 +6,7 @@ desktop.ini
 *.swp
 
 target/
+__pycache__/
 
 *.exe
 *.pdb

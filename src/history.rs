@@ -8,8 +8,15 @@ use crate::receiver::Ack;
 const SENT: &str = "sent.log";
 const RECEIVED: &str = "received.log";
 
-/// Where netcast keeps its logs unless told otherwise.
+/// Where netcast keeps its logs and key unless told otherwise: next to the exe
+/// when a file named `portable` is there, otherwise the user's own folder.
 pub fn default_dir() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+        && dir.join("portable").is_file()
+    {
+        return dir.to_path_buf();
+    }
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
         return PathBuf::from(local).join("netcast");
     }

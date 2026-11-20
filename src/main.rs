@@ -15,6 +15,7 @@ mod sender;
 mod sim;
 mod station;
 mod ui;
+mod upgrade;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -114,6 +115,12 @@ enum Cmd {
     Roster {
         #[command(subcommand)]
         cmd: RosterCmd,
+    },
+    /// Install the newest netcast release, after checking it against the release's checksums.
+    Upgrade {
+        /// Only say whether there's a newer release.
+        #[arg(long)]
+        check: bool,
     },
     /// Show past deliveries, sent and received.
     Status {
@@ -272,7 +279,19 @@ fn main() {
 /// False when the command ran but didn't fully succeed, like a station that
 /// never confirmed.
 fn run(cli: Cli) -> Result<bool> {
+    upgrade::clean_up();
+    // the long-running commands, where the background check has time to finish
+    if matches!(
+        cli.cmd,
+        Cmd::Listen { .. } | Cmd::Send { .. } | Cmd::Ui { .. }
+    ) {
+        upgrade::notice(&history::default_dir(), unix_now());
+    }
     match cli.cmd {
+        Cmd::Upgrade { check } => {
+            upgrade::run(check)?;
+            Ok(true)
+        }
         Cmd::Listen { inbox, radio } => {
             let roster = load_roster(inbox.roster.as_deref())?;
             let call = first_call(&inbox)?;
