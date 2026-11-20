@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  netcast - MSI installer (WiX Toolset v7)
+
+  Built by the release workflow, once per architecture:
+    wix build -arch x64 -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext
+              -d Version=1.2.3 -d BinDir=..\target\x86_64-pc-windows-msvc\release
+              -o netcast-1.2.3-x64.msi installer\netcast.wxs
+  The workflow also writes installer\license.rtf from LICENSE first
+  (WixUI shows the license from an RTF file).
+
+  One-time WiX setup on a dev machine: see windows-installer.md in the
+  londopy-style skill (dotnet tool, two extensions, EULA acceptance).
+  XML comments can't contain two hyphens in a row, so the commands live there.
+
+  Install scope: per-user by default (no UAC, %LOCALAPPDATA%\Programs\netcast,
+  same folder as the Inno setup.exe). IT admins install machine-wide with:
+    msiexec /i netcast-<ver>-x64.msi ALLUSERS=2 MSIINSTALLPERUSER=""
+
+  netcast is a command-line program, so the MSI puts it on the user's PATH
+  instead of making shortcuts.
+
+  Don't install the MSI and the setup.exe side by side; they share a folder.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <!-- the workflow passes -d Version=<numeric version>; MSI versions must be
+       plain numbers, so prerelease suffixes like -rc1 are stripped first -->
+  <?ifndef Version ?>
+    <?define Version = "0.0.0" ?>
+  <?endif?>
+  <?ifndef BinDir ?>
+    <?define BinDir = "..\target\release" ?>
+  <?endif?>
+
+  <!-- Id replaces the old UpgradeCode GUID: any newer MSI with the same Id
+       upgrades an older one in place. Never reuse this Id for a different app. -->
+  <Package Id="Londopy.netcast"
+           Name="netcast"
+           Manufacturer="Londopy"
+           Version="$(var.Version)"
+           Language="1033"
+           Scope="perUserOrMachine">
+
+    <!-- same-version reinstall works (handy for testing); downgrades are refused -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of netcast is already installed." />
+
+    <!-- one msi file, no loose .cab next to it -->
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <!-- Add/Remove Programs: icon and links -->
+    <Icon Id="AppIcon" SourceFile="..\assets\netcast.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/Londopy/netcast" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/Londopy/netcast/issues" />
+    <Property Id="ARPURLUPDATEINFO" Value="https://github.com/Londopy/netcast/releases" />
+
+    <!-- UI: license page and Install button -->
+    <ui:WixUI Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="license.rtf" />
+
+    <!-- a running netcast (a listener, the web page) is left to Windows
+         Installer's files-in-use prompt: killing it silently could cut a
+         delivery off halfway -->
+
+    <Feature Id="Main" Title="netcast" Level="1">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="UserPath" />
+      <ComponentRef Id="MachinePath" />
+    </Feature>
+
+    <!-- per-user: %LOCALAPPDATA%\Programs\netcast
+         all users: C:\Program Files\netcast (Program Files (x86) for the x86 msi) -->
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="netcast">
+
+        <Component Id="MainExecutable">
+          <File Id="MainExe" Source="$(var.BinDir)\netcast.exe" KeyPath="yes" />
+        </Component>
+
+        <!-- add the folder to PATH; Permanent="no" takes it off again on uninstall.
+             A per-user install writes the user's PATH, which is all it may touch;
+             an all-users install (ALLUSERS=1 once the scope is settled) writes
+             the machine's, so every user gets netcast -->
+        <Component Id="UserPath" Condition="NOT (ALLUSERS = 1)">
+          <Environment Id="UserPath" Name="PATH" Value="[INSTALLFOLDER]"
+                       Part="last" Action="set" System="no" Permanent="no" />
+          <RegistryValue Root="HKMU" Key="Software\Londopy\netcast"
+                         Name="UserPath" Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+        <Component Id="MachinePath" Condition="ALLUSERS = 1">
+          <Environment Id="MachinePath" Name="PATH" Value="[INSTALLFOLDER]"
+                       Part="last" Action="set" System="yes" Permanent="no" />
+          <RegistryValue Root="HKMU" Key="Software\Londopy\netcast"
+                         Name="MachinePath" Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <!-- uninstall leaves %LOCALAPPDATA%\netcast alone on purpose: it holds the
+         station's signing key and delivery history -->
+  </Package>
+</Wix>

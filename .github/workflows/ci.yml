@@ -46,3 +46,64 @@ jobs:
 
       - name: Run tests
         run: cargo test --all
+
+  # The release builds x86 and arm64 too; catch a break there now rather than
+  # on tag day (ring, for one, needs clang to build for arm64).
+  cross:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [i686-pc-windows-msvc, aarch64-pc-windows-msvc]
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+  # Compiles the Inno and WiX scripts the way release.yml does, so a mistake in
+  # them shows up on the pull request instead of in a failed release.
+  installers:
+    name: Installers compile
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=0.0.0 installer\netcast.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+
+      - name: WiX
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 7.0.0
+          if ($LASTEXITCODE -ne 0) { throw "installing wix failed" }
+          wix eula accept wix7
+          if ($LASTEXITCODE -ne 0) { throw "accepting the WiX EULA failed" }
+          wix extension add --global WixToolset.UI.wixext/7.0.0 WixToolset.Util.wixext/7.0.0
+          if ($LASTEXITCODE -ne 0) { throw "adding the WiX extensions failed" }
+          "{\rtf1\ansi netcast}" | Set-Content installer\license.rtf -Encoding ascii
+          Push-Location installer
+          wix build -arch x64 -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext -d Version=0.0.0 -o check.msi netcast.wxs
+          if ($LASTEXITCODE -ne 0) { throw "wix build failed" }
+          Pop-Location
