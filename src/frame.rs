@@ -141,10 +141,13 @@ pub enum Frame {
         data: Vec<u8>,
     },
     /// Asks the stations flagged in `polled` (indexes into the recipient list) to report,
-    /// each in its own slot of `slot_ms`, in list order.
+    /// each in its own slot of `slot_ms`, in list order. Slot 0 starts `lead_ms` after
+    /// the request is heard, which leaves room for anything the sender's TNC sends
+    /// after it, such as an ARDOP ID frame.
     Status {
         id: u32,
         round: u8,
+        lead_ms: u16,
         slot_ms: u16,
         polled: Vec<bool>,
     },
@@ -191,11 +194,13 @@ impl Frame {
             Frame::Symbol { data, .. } => b.extend_from_slice(data),
             Frame::Status {
                 round,
+                lead_ms,
                 slot_ms,
                 polled,
                 ..
             } => {
                 b.push(*round);
+                b.extend_from_slice(&lead_ms.to_be_bytes());
                 b.extend_from_slice(&slot_ms.to_be_bytes());
                 b.push(polled.len() as u8);
                 let mut bits = vec![0u8; polled.len().div_ceil(8)];
@@ -250,6 +255,7 @@ impl Frame {
             }
             TYPE_STATUS => {
                 let round = r.u8()?;
+                let lead_ms = r.u16()?;
                 let slot_ms = r.u16()?;
                 let n = r.u8()? as usize;
                 let bits = r.take(n.div_ceil(8))?;
@@ -259,6 +265,7 @@ impl Frame {
                 Some(Frame::Status {
                     id,
                     round,
+                    lead_ms,
                     slot_ms,
                     polled,
                 })
@@ -355,6 +362,7 @@ mod tests {
             Frame::Status {
                 id: 1,
                 round: 2,
+                lead_ms: 2300,
                 slot_ms: 900,
                 polled: vec![true, false, true],
             },
@@ -394,6 +402,7 @@ mod tests {
         let f = Frame::Status {
             id: 1,
             round: 1,
+            lead_ms: 0,
             slot_ms: 1,
             polled: polled.clone(),
         };

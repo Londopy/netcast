@@ -131,8 +131,8 @@ impl Link for SimLink {
         self.now
     }
 
-    fn tx_done_ms(&self) -> u64 {
-        self.channel.busy_until()
+    fn tx_done_ms(&mut self) -> io::Result<u64> {
+        Ok(self.channel.busy_until())
     }
 }
 
@@ -182,6 +182,7 @@ fn plan(cfg: &Config, ch: &Channel) -> Plan {
         repeats: 0,
         repeat_gap_ms: 0,
         slot_ms: sender::slot_ms(ch, cfg.guard_ms),
+        lead_ms: 0,
         guard_ms: cfg.guard_ms,
     }
 }
@@ -363,6 +364,27 @@ mod tests {
         .unwrap();
         assert_eq!(states, vec![State::Decoded; 6]);
         assert_eq!(rounds, 1);
+    }
+
+    #[test]
+    fn the_reply_window_counts_the_lead_time() {
+        let cfg = config(vec![0.0]);
+        let msg = test_message(1000, 1, 8);
+        let d = Delivery::new(42, &msg, envelope(1), cfg.frame_max, None).unwrap();
+        let mut link = SimLink::new(vec![station(0, 0.0, 8)], cfg.baud, cfg.txdelay_ms);
+        // a lead much longer than slot and guard together, as over ARDOP
+        let p = Plan {
+            lead_ms: 3000,
+            ..plan(&cfg, &link.channel)
+        };
+        let mut rounds = 0;
+        let states = sender::run(&mut link, &d, &p, |p| {
+            if let sender::Progress::Status { .. } = p {
+                rounds += 1;
+            }
+        })
+        .unwrap();
+        assert_eq!((states, rounds), (vec![State::Decoded], 1));
     }
 
     #[test]

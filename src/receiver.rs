@@ -11,7 +11,7 @@ const UNANNOUNCED_TTL_MS: u64 = 30 * 60_000;
 const MAX_TTL_MS: u64 = 24 * 3_600_000;
 const MAX_PENDING: usize = 4096;
 const MAX_DELIVERIES: usize = 64;
-// longer slots than this can only be a mistake or mischief
+// longer slots or leads than this can only be a mistake or mischief
 const MAX_SLOT_MS: u16 = 10_000;
 
 /// A recipient-list index this station acknowledges for, and the callsign it stands for.
@@ -213,10 +213,11 @@ impl Receiver {
             Frame::Symbol { esi, data, .. } => self.on_symbol(id, esi, data),
             Frame::Status {
                 round,
+                lead_ms,
                 slot_ms,
                 polled,
                 ..
-            } => self.on_status(id, round, slot_ms, &polled, now_ms),
+            } => self.on_status(id, round, (lead_ms, slot_ms), &polled, now_ms),
             Frame::Report { .. } => vec![],
         }
     }
@@ -438,12 +439,12 @@ impl Receiver {
         &mut self,
         id: u32,
         round: u8,
-        slot_ms: u16,
+        (lead_ms, slot_ms): (u16, u16),
         polled: &[bool],
         now_ms: u64,
     ) -> Vec<Output> {
         let d = self.deliveries.get_mut(&id).expect("delivery exists");
-        if d.answered == Some(round) || slot_ms > MAX_SLOT_MS {
+        if d.answered == Some(round) || slot_ms > MAX_SLOT_MS || lead_ms > MAX_SLOT_MS {
             return vec![];
         }
         let (acks, need) = match &d.state {
@@ -459,7 +460,7 @@ impl Receiver {
             .map(|(i, _)| {
                 let slot = polled[..*i as usize].iter().filter(|p| **p).count() as u64;
                 Output::Report {
-                    at_ms: now_ms + slot * slot_ms as u64,
+                    at_ms: now_ms + lead_ms as u64 + slot * slot_ms as u64,
                     frame: Frame::Report {
                         id,
                         round,
@@ -498,8 +499,8 @@ mod tests {
         fn now_ms(&self) -> u64 {
             0
         }
-        fn tx_done_ms(&self) -> u64 {
-            0
+        fn tx_done_ms(&mut self) -> std::io::Result<u64> {
+            Ok(0)
         }
     }
 
@@ -529,6 +530,7 @@ mod tests {
             repeats: 0,
             repeat_gap_ms: 0,
             slot_ms: 500,
+            lead_ms: 0,
             guard_ms: 0,
         };
         let mut tape = Tape(vec![]);
@@ -547,6 +549,7 @@ mod tests {
         Frame::Status {
             id: 77,
             round,
+            lead_ms: 0,
             slot_ms: 500,
             polled,
         }
@@ -795,6 +798,7 @@ mod tests {
             repeats: 0,
             repeat_gap_ms: 0,
             slot_ms: 500,
+            lead_ms: 0,
             guard_ms: 0,
         };
         let mut tape = Tape(vec![]);

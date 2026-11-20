@@ -185,8 +185,8 @@ impl Link for KissLink {
         self.start.elapsed().as_millis() as u64
     }
 
-    fn tx_done_ms(&self) -> u64 {
-        self.channel.busy_until()
+    fn tx_done_ms(&mut self) -> io::Result<u64> {
+        Ok(self.channel.busy_until())
     }
 }
 #[cfg(test)]
@@ -258,7 +258,7 @@ mod tests {
         )
         .unwrap();
         link.send(b"hello").unwrap();
-        assert!(link.tx_done_ms() >= 300);
+        assert!(link.tx_done_ms().unwrap() >= 300);
         let deadline = link.now_ms() + 2000;
         assert_eq!(link.recv_until(deadline).unwrap(), Some(b"report".to_vec()));
 
@@ -289,7 +289,7 @@ mod tests {
         .unwrap();
         for _ in 0..60 {
             link.send(&[0u8; 256]).unwrap();
-            let queued = link.tx_done_ms().saturating_sub(link.now_ms());
+            let queued = link.tx_done_ms().unwrap().saturating_sub(link.now_ms());
             assert!(queued <= (PACE_FRAMES + 1) * frame_ms, "{queued} ms queued");
         }
         // 60 frames can't all have gone straight into the queue

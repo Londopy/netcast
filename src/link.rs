@@ -6,12 +6,18 @@ pub trait Link {
     /// Waits for the next netcast frame until `deadline_ms`.
     fn recv_until(&mut self, deadline_ms: u64) -> io::Result<Option<Vec<u8>>>;
     fn now_ms(&self) -> u64;
-    /// When everything handed to `send` so far will have left the transmitter.
-    fn tx_done_ms(&self) -> u64;
+    /// When everything handed to `send` so far will have left the transmitter. A link
+    /// that can only find out by asking its TNC waits here and returns the time then.
+    fn tx_done_ms(&mut self) -> io::Result<u64>;
+    /// Identifies the station once more at the end of a delivery, where the
+    /// transport doesn't already put the callsign in every frame.
+    fn sign_off(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Waits out the clock, dropping whatever arrives.
-pub fn idle(link: &mut impl Link, until_ms: u64) -> io::Result<()> {
+pub fn idle(link: &mut (impl Link + ?Sized), until_ms: u64) -> io::Result<()> {
     while link.now_ms() < until_ms {
         link.recv_until(until_ms)?;
     }

@@ -40,6 +40,8 @@ pub struct Plan {
     pub repeats: u32,
     pub repeat_gap_ms: u64,
     pub slot_ms: u16,
+    /// How long receivers wait after hearing a status request before slot 0.
+    pub lead_ms: u16,
     pub guard_ms: u64,
 }
 
@@ -100,6 +102,18 @@ impl Delivery {
         if n == 0 || n > 255 {
             return Err(format!("{n} recipients; netcast takes 1 to 255"));
         }
+        let status = Frame::Status {
+            id,
+            round: 1,
+            lead_ms: 0,
+            slot_ms: 0,
+            polled: vec![true; n],
+        };
+        if status.encode().len() > frame_max {
+            return Err(format!(
+                "a status request for {n} recipients doesn't fit in one {frame_max}-byte frame; send to fewer at a time, or use a bigger FEC mode"
+            ));
+        }
         if let Some(bad) = std::iter::once(&env.from)
             .chain(&env.recipients)
             .find(|s| !valid_name(s))
@@ -151,7 +165,7 @@ impl Delivery {
     }
 }
 
-struct Session<'a, L: Link> {
+struct Session<'a, L: Link + ?Sized> {
     link: &'a mut L,
     d: &'a Delivery,
     next_repair: u32,
@@ -162,7 +176,7 @@ struct Session<'a, L: Link> {
     closing_announce: bool,
 }
 
-impl<L: Link> Session<'_, L> {
+impl<L: Link + ?Sized> Session<'_, L> {
     fn send(&mut self, f: Frame) -> io::Result<()> {
         self.link.send(&f.encode())
     }
@@ -218,11 +232,12 @@ impl<L: Link> Session<'_, L> {
         self.send(Frame::Status {
             id: self.d.id,
             round,
+            lead_ms: plan.lead_ms,
             slot_ms: plan.slot_ms,
             polled: polled.clone(),
         })?;
         let slot = plan.slot_ms as u64;
-        let start = self.link.tx_done_ms();
+        let start = self.link.tx_done_ms()? + plan.lead_ms as u64;
         // the airtime model and the TNC's carrier sense can both put us behind; when a
         // reply comes late, assume the rest will be just as late and wait for them
         let mut late = 0;
@@ -254,6 +269,12 @@ impl<L: Link> Session<'_, L> {
             heard[i] = true;
             states[i] = need.map_or(State::Decoded, State::Need);
         }
+        if heard.iter().filter(|h| **h).count() == n {
+            // everyone answered early; the last one's TNC may still be sending after its
+            // report (an ARDOP ID frame), so don't key up on top of it
+            let until = self.link.now_ms() + plan.lead_ms as u64;
+            idle(self.link, until)?;
+        }
         for (i, s) in states.iter_mut().enumerate() {
             if polled[i] && !heard[i] {
                 *s = State::Silent;
@@ -266,7 +287,7 @@ impl<L: Link> Session<'_, L> {
 /// Runs one delivery to the end and returns each recipient's final state.
 /// Without acks every state stays `Pending`, since nobody tells us.
 pub fn run(
-    link: &mut impl Link,
+    link: &mut (impl Link + ?Sized),
     d: &Delivery,
     plan: &Plan,
     mut progress: impl FnMut(Progress),
@@ -312,14 +333,15 @@ pub fn run(
         }
     } else {
         for _ in 0..plan.repeats {
-            let until = s.link.tx_done_ms() + plan.repeat_gap_ms;
+            let until = s.link.tx_done_ms()? + plan.repeat_gap_ms;
             idle(s.link, until)?;
             let again = s.fresh(k + extra);
             s.pass(again)?;
             progress(Progress::Pass { symbols: k + extra });
         }
     }
-    let done = s.link.tx_done_ms();
+    let done = s.link.tx_done_ms()?;
     idle(s.link, done)?;
+    s.link.sign_off()?;
     Ok(states)
 }
