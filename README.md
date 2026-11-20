@@ -45,9 +45,9 @@ of frames each, at 1200 baud with 300 ms TXDELAY:
 
 | Message | netcast | FLAMP-style hole lists | 20 separate sessions |
 |---|---|---|---|
-| 4 kB body (2.6 kB compressed, 11 symbols) | 92 s | 96 s | 767 s |
-| 20 kB body (12 kB compressed, 51 symbols) | 215 s | 345 s | 3243 s |
-| 4 kB body, every station at 40% loss | 165 s | 189 s | 1382 s |
+| 4 kB body (2.6 kB compressed, 11 symbols) | 93 s | 96 s | 767 s |
+| 20 kB body (12 kB compressed, 51 symbols) | 217 s | 345 s | 3243 s |
+| 4 kB body, every station at 40% loss | 167 s | 189 s | 1382 s |
 
 Every method got the message to all 20 stations in every trial. On short messages the status
 slots cost about as much as the data, so netcast and FLAMP come out close. The gap opens as
@@ -68,7 +68,8 @@ timers. Run `netcast sim --help` to try other nets.
   each station's state live
 - A net roster file that net control shares ahead of time, with members, groups and keys
 - Optional Ed25519 signatures, so stations can tell a message really came from net control
-- Works over Direwolf's KISS port today, using plain AX.25 UI frames at 1200 or 9600 baud
+- Works over Direwolf's KISS port, using plain AX.25 UI frames at 1200 or 9600 baud, and over
+  ardopcf's FEC mode on HF
 - The on-air format is published in [docs/protocol.md](docs/protocol.md)
 
 ## Install
@@ -116,6 +117,7 @@ itself when Direwolf restarts, and decoded messages show up in Pat as unread.
 | `--ack` | off | ask for acknowledgements on an emergency message |
 | `--repeat`, `--interval` | 0, 600 s | extra full passes for bulletins, and the gap between them |
 | `--ttl` | 60 min | how long receivers keep a delivery after they last hear it, up to 24 hours |
+| `--via` | `direwolf` | `direwolf` or `ardop` |
 | `--kiss` | `127.0.0.1:8001` | Direwolf's KISS TCP port |
 | `--guard` | 500 ms | slack added to each report slot |
 | `--sign` | off | sign the announcement with this station's key |
@@ -124,6 +126,39 @@ itself when Direwolf restarts, and decoded messages show up in Pat as unread.
 Each station's Direwolf waits for a clear channel before it answers, which can push its reply
 past its slot. The sender allows for replies that run late, but on a busy channel a station can
 still be marked silent for a round. If that keeps happening, raise `--guard`.
+
+## Over HF with ardopcf
+
+netcast can use [ardopcf](https://github.com/pflarue/ardop) in FEC mode instead of Direwolf.
+Tested against ardopcf 1.0.4.1.3, whose maintainer has stopped development.
+
+```text
+netcast listen --call K1ABC --net NET1 --via ardop --ardop 127.0.0.1:8515
+netcast send note.txt --subject "Net check-in" --to K1ABC,W2XYZ --from N0NCS --net NET1 --via ardop --fecmode 4FSK.500.100
+```
+
+`--ardop` is ardopcf's command port; its data port is the next one up. `--fecmode` picks the
+frame type messages go out in: any type with at least 32 data bytes, from the robust
+4FSK.500.100S up to 16QAM.2000.100. ardopcf takes one host connection at a time, so on the web
+page the listener steps aside while the page sends. ardopcf doesn't refuse a second program,
+though: if Pat or anything else connects to it while netcast is listening, netcast quietly
+stops hearing the net, so give netcast its own ardopcf.
+
+HF FEC is slow. On ardopcf's default settings a 4FSK.500.100 frame (48 bytes of message) takes
+about 3.8 seconds plus a 0.4-second gap, and each station's reply slot takes about 4.5 seconds.
+A 200-byte message to two stations is roughly a minute for the first pass and 15 seconds per
+status round.
+
+Tested over a virtual audio cable, with three and four ardopcf instances on one channel:
+
+- **What worked:** messages decoded into Pat's inbox, status requests and replies went both
+  ways, and the page handed the TNC between its listener and its sender.
+- **The channel:** ardopcf failed to decode about half its frames, in every mode tried. With
+  that much loss, a status request and its reply both getting through is a coin toss squared,
+  so stations often show as silent for several rounds.
+- **What to do about it:** on a channel that bad, bulletin mode with a bigger `--margin` and a
+  `--repeat` gets the message through better than waiting on status rounds. How a real radio
+  link compares is untested.
 
 ## The net roster
 
@@ -223,7 +258,8 @@ cargo test
 
 ## Not there yet
 
-- ardopcf FEC mode, and `ofm`'s connectionless port
+- `ofm`'s connectionless port, which waits on `ofm` itself
+- A test with real radios, Direwolf or ardopcf on the air
 - Opening `.londopy` rosters by double-clicking them in Explorer, which comes with the installer
 - Winlink Express inboxes, since Express keeps its own message store
 
@@ -245,6 +281,7 @@ src/
   receiver.rs   per-delivery receive state and reports
   ax25.rs       AX.25 UI frames
   kiss.rs       KISS over TCP
+  ardop.rs      ardopcf's host interface in FEC mode
   link.rs       the radio link interface and the airtime model
   sim.rs        the net simulator and the FLAMP and session baselines
   pat.rs        Pat mailbox lookup and inbox writes

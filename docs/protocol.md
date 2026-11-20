@@ -18,6 +18,31 @@ UI frame:
 The largest frame is 256 bytes, so the symbol size is 244 bytes. Receivers listen only to frames
 sent to the net's address. Reports from receivers go to the same address.
 
+Over ARDOP (ardopcf in FEC mode), each netcast frame travels in one ARDOP FEC data frame:
+
+| Size | Field |
+|---|---|
+| 2 | length of the netcast frame |
+| n | the netcast frame |
+| rest | filler up to the data size of the FEC frame type |
+
+ardopcf cuts the data it's given into frames by byte count alone, so every netcast frame is
+filled out to exactly one FEC frame, and a lost FEC frame is one lost netcast frame. The filler
+isn't zeros: on a test channel, frames padded with long runs of one byte value failed to decode
+much more often. Receivers read the length and ignore the rest.
+
+The frame type for messages is the sender's choice; netcast takes any FEC type of at least 32
+data bytes. The symbol size is the frame's data size minus 14 (the length and the 12-byte
+header), rounded down to a multiple of 4: 48 bytes for 4FSK.500.100, for example. Receivers
+always answer status requests in 4FSK.500.100S, a robust 32-byte type, so the sender knows how
+long an answer takes.
+
+ARDOP frames carry no callsign. Every station runs ardopcf with `FECID TRUE`, so each
+transmission includes an ARDOP ID frame naming the station (97.119). ardopcf sends that ID
+frame after the first data frame of a transmission only, so at the end of a delivery the sender
+asks for one more (`SENDID`), and the delivery closes with the station's ID. A receiver's report
+is a single frame, so its ID frame comes right after it.
+
 ## Frame header
 
 Every frame starts with these 12 bytes:
@@ -162,19 +187,29 @@ Sent only in addressed mode, or in emergency mode when the sender asks for ackno
 | Size | Field |
 |---|---|
 | 1 | round number, starting at 1 |
+| 2 | lead time in milliseconds: how long after hearing the request slot 0 starts |
 | 2 | slot length in milliseconds |
 | 1 | n, the length of the recipient list |
 | ceil(n/8) | bitmap of polled recipients, most significant bit first: bit i is entry i of the list |
 
 Each polled station replies in its own slot. Slots are numbered in list order among the polled
-stations only. The station in slot s starts transmitting s x slot length after it has received
-the request. A station that has already reported `decoded` is not polled again.
+stations only. The station in slot s starts transmitting lead + s x slot length after it has
+received the request. A station that has already reported `decoded` is not polled again.
 
 A station answers each round once, however many copies of the request it hears, and ignores
-slot lengths over 10 seconds.
+lead times and slot lengths over 10 seconds.
 
-The sender sets the slot length to TXDELAY + report airtime + a guard (500 ms by default). It
-waits for every slot, plus one more guard, after its own transmission ends. When a reply arrives
+The lead time leaves room for anything the sender's TNC may still send after the request. Over
+AX.25 it is 0. Over ARDOP it is 2300 ms: when the request is the first frame of a transmission,
+ardopcf follows it with a 1.8-second ID frame, and a station that answered straight away would
+talk over it.
+
+The sender sets the slot length to the report's airtime plus a guard (500 ms by default). Over
+AX.25 the airtime is TXDELAY plus the frame. Over ARDOP it is 4000 ms, measured on ardopcf
+1.0.4.1.3: one 4FSK.500.100S frame, the gap, and the ID frame after it. Once its own
+transmission ends (over ARDOP, when ardopcf reports it has finished), the sender waits out the
+lead time, every slot, and one more guard. If every station has answered sooner, it still waits
+one lead time before sending again, so it doesn't start on top of the last station's ID frame. When a reply arrives
 after the end of its slot, the sender assumes the rest are running just as late, and waits that
 much longer, up to the length of the whole slot window.
 

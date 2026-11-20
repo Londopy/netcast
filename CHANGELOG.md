@@ -24,6 +24,9 @@ what appears on its GitHub release page. Validated in CI by
 - `netcast ui`: a web page on 127.0.0.1 for composing, sending from an outbox folder, picking
   recipients from the roster, and watching each station's state and incoming messages live.
 - Net rosters as `.londopy` files, with `netcast roster new`, `add`, `remove` and `show`.
+- ardopcf FEC mode as a second transport (`--via ardop`), for HF. Each netcast frame fills
+  exactly one ARDOP frame, status rounds are timed from ardopcf's own end-of-transmission
+  report, and receivers answer in 4FSK.500.100S.
 - Optional Ed25519 signatures: `netcast key`, `send --sign`, and `listen --require-signed`.
   Receivers check signatures against the roster and label each message.
 
