@@ -5,7 +5,7 @@ use std::io;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
-use crate::frame::{Frame, HEADER_LEN, Mode};
+use crate::frame::{Frame, HEADER_LEN, Mode, Precedence};
 use crate::link::{Channel, Link};
 use crate::message;
 use crate::receiver::{Output, Receiver};
@@ -170,6 +170,7 @@ fn envelope(n: usize) -> Envelope {
         from: "N0NCS".into(),
         recipients: (0..n).map(call).collect(),
         mode: Mode::Addressed,
+        precedence: Precedence::Routine,
         ttl_min: 60,
     }
 }

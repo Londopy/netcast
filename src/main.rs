@@ -25,7 +25,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use ardop::FecMode;
 use ax25::Addr;
-use frame::Mode;
+use frame::{Mode, Precedence};
 use roster::Roster;
 use sender::{Progress, State};
 use station::{AX25_FRAME_MAX, Inbox, Outgoing, Radio, Station, Transport, unix_now};
@@ -65,6 +65,10 @@ enum Cmd {
         subject: Option<String>,
         #[arg(long, value_enum, default_value_t = ModeArg::Addressed)]
         mode: ModeArg,
+        /// How urgent the message is, as on a radiogram [default: emergency in
+        /// emergency mode, otherwise routine].
+        #[arg(long, value_enum)]
+        precedence: Option<PrecedenceArg>,
         /// Extra symbols in each full pass, as a fraction of the message
         /// [default: 0.1 with acknowledgements, 0.5 without].
         #[arg(long)]
@@ -269,6 +273,25 @@ enum ModeArg {
     Emergency,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum PrecedenceArg {
+    Routine,
+    Welfare,
+    Priority,
+    Emergency,
+}
+
+impl From<PrecedenceArg> for Precedence {
+    fn from(p: PrecedenceArg) -> Precedence {
+        match p {
+            PrecedenceArg::Routine => Precedence::Routine,
+            PrecedenceArg::Welfare => Precedence::Welfare,
+            PrecedenceArg::Priority => Precedence::Priority,
+            PrecedenceArg::Emergency => Precedence::Emergency,
+        }
+    }
+}
+
 impl From<ModeArg> for Mode {
     fn from(m: ModeArg) -> Mode {
         match m {
@@ -320,6 +343,7 @@ fn run(cli: Cli) -> Result<bool> {
             from,
             subject,
             mode,
+            precedence,
             margin,
             rounds,
             ack,
@@ -336,6 +360,9 @@ fn run(cli: Cli) -> Result<bool> {
             let to = station::recipients(&to, roster.as_ref(), &from)?;
             let b2f = load_message(&file, &from, &to, subject.as_deref())?;
             let mut out = Outgoing::new(b2f, to.clone(), Mode::from(mode), ack)?;
+            if let Some(p) = precedence {
+                out.precedence = p.into();
+            }
             out.margin = margin.unwrap_or(out.margin);
             out.rounds = rounds;
             out.ttl_min = ttl;
@@ -634,10 +661,11 @@ fn print_start(d: &sender::Delivery) {
         ""
     };
     println!(
-        "delivery {:08x}: {} ({}{signed}), {} bytes compressed in {} symbols, to {}",
+        "delivery {:08x}: {} ({}, {}{signed}), {} bytes compressed in {} symbols, to {}",
         d.id,
         d.announce.mid,
         d.announce.mode.name(),
+        d.announce.precedence.name(),
         d.announce.oti.transfer_length(),
         d.k(),
         d.announce.recipients.join(", ")

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use ed25519_dalek::VerifyingKey;
 
 use crate::codec::{self, Assembly};
-use crate::frame::{Announce, CODEC_BROTLI_RAPTORQ, Frame, Mode};
+use crate::frame::{Announce, CODEC_BROTLI_RAPTORQ, Frame, Mode, Precedence};
 use crate::{keys, message};
 
 // how long to hold symbols for a delivery whose announcement hasn't decoded yet
@@ -38,25 +38,24 @@ impl Trust {
     }
 }
 
+/// A delivery for us, heard about before any of it decodes.
+#[derive(Debug)]
+pub struct Announced {
+    pub id: u32,
+    pub mode: Mode,
+    pub precedence: Precedence,
+    pub from: String,
+    pub mid: String,
+    pub k: u32,
+    pub trust: Trust,
+}
+
 #[derive(Debug)]
 pub enum Output {
-    Announced {
-        id: u32,
-        mode: Mode,
-        from: String,
-        mid: String,
-        k: u32,
-        trust: Trust,
-    },
-    Report {
-        at_ms: u64,
-        frame: Frame,
-    },
+    Announced(Announced),
+    Report { at_ms: u64, frame: Frame },
     Decoded(Decoded),
-    Failed {
-        id: u32,
-        why: String,
-    },
+    Failed { id: u32, why: String },
 }
 
 #[derive(Debug)]
@@ -64,6 +63,7 @@ pub struct Decoded {
     pub id: u32,
     pub mid: String,
     pub mode: Mode,
+    pub precedence: Precedence,
     pub from: String,
     pub trust: Trust,
     /// Local callsigns whose inbox gets the message.
@@ -290,14 +290,15 @@ impl Receiver {
         let pending = std::mem::take(pending);
         d.ttl_ms = (a.ttl_min as u64 * 60_000).min(MAX_TTL_MS);
         let payload = Assembly::new(a.oti).expect("checked in accept");
-        let mut out = vec![Output::Announced {
+        let mut out = vec![Output::Announced(Announced {
             id,
             mode: a.mode,
+            precedence: a.precedence,
             from: a.from.clone(),
             mid: a.mid.clone(),
             k: payload.k(),
             trust,
-        }];
+        })];
         d.state = State::Receiving {
             announce: Box::new(a),
             trust,
@@ -421,6 +422,7 @@ impl Receiver {
             id,
             mid: announce.mid.clone(),
             mode: announce.mode,
+            precedence: announce.precedence,
             from: announce.from.clone(),
             trust: *trust,
             calls: std::mem::take(calls),
@@ -520,6 +522,7 @@ mod tests {
             from: "N0NCS".into(),
             recipients: to,
             mode,
+            precedence: Precedence::default_for(mode),
             ttl_min: 60,
         };
         let d = Delivery::new(77, &msg, env, 256, key).unwrap();
@@ -575,6 +578,25 @@ mod tests {
         assert_eq!(d.b2f, msg);
         assert_eq!(d.calls, vec!["K1ABC".to_string(), "K1ABC-7".to_string()]);
         assert!(d.acks.is_empty());
+    }
+
+    #[test]
+    fn emergency_traffic_arrives_marked_emergency() {
+        let (f, _) = frames(&["K1ABC"], Mode::Emergency, 0.0);
+        let mut rx = Receiver::new(vec!["K1ABC".into()], vec![]);
+        let out = feed(&mut rx, &f);
+        let Some(Output::Announced(a)) = out.iter().find(|o| matches!(o, Output::Announced(_)))
+        else {
+            panic!("no announcement");
+        };
+        assert_eq!(a.precedence, Precedence::Emergency);
+        let Some(Output::Decoded(d)) = out.iter().find(|o| matches!(o, Output::Decoded(_))) else {
+            panic!("did not decode");
+        };
+        assert_eq!(
+            (d.mode, d.precedence),
+            (Mode::Emergency, Precedence::Emergency)
+        );
     }
 
     #[test]
@@ -788,6 +810,7 @@ mod tests {
             from: "N0NCS".into(),
             recipients: to,
             mode: Mode::Addressed,
+            precedence: Precedence::Routine,
             ttl_min: u16::MAX,
         };
         let d = Delivery::new(77, &msg, env, 256, None).unwrap();

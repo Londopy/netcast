@@ -105,7 +105,7 @@ pub fn verify(a: &Announce, id: u32, key: &VerifyingKey) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::{CODEC_BROTLI_RAPTORQ, Mode};
+    use crate::frame::{CODEC_BROTLI_RAPTORQ, Mode, Precedence};
     use raptorq::ObjectTransmissionInformation;
 
     fn announce() -> Announce {
@@ -114,6 +114,7 @@ mod tests {
             oti: ObjectTransmissionInformation::new(1000, 244, 1, 1, 4),
             hash: [1; 32],
             mode: Mode::Addressed,
+            precedence: Precedence::Routine,
             ttl_min: 60,
             from: "N0NCS".into(),
             mid: "ABC123".into(),
@@ -137,6 +138,9 @@ mod tests {
         let mut changed = a.clone();
         changed.recipients.push("W2XYZ".into());
         assert!(!verify(&changed, 77, &public), "recipient added");
+        let mut changed = a.clone();
+        changed.precedence = Precedence::Emergency;
+        assert!(!verify(&changed, 77, &public), "precedence raised");
 
         let other = SigningKey::from_bytes(&[8; 32]).verifying_key();
         assert!(!verify(&a, 77, &other));
@@ -170,11 +174,11 @@ mod tests {
         );
         assert_eq!(
             hex(&a.body()),
-            "0100000003e80000f401000104010101010101010101010101010101010101010101010101010101010101010101003c054e304e43530641424331323301054b31414243"
+            "0100000003e80000f40100010401010101010101010101010101010101010101010101010101010101010101010100003c054e304e43530641424331323301054b31414243"
         );
         assert_eq!(
             hex(&a.signature.unwrap()),
-            "c031e185fa51601ced1672303a51c0652d57f4efc863a98d66cf0b83a2a3164bc612b7dd3208d83f2e8dfbedd0f92f0d2a34196b3b52afc892cadaef732d9804"
+            "4d2da94f31b4bd5248f514d3d912a6b1080c006fc53058949e7ec8be7871ce62b6e1d3b768fab14100495edbed200a2bc8fdba89842a95a4118167c6d2cf6f0f"
         );
         assert_eq!(&DOMAIN[..19], b"netcast announce v1");
         assert_eq!(DOMAIN.len(), 20);

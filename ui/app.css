@@ -170,9 +170,9 @@ th, td { text-align: left; padding: 0.3rem 0.5rem 0.3rem 0; border-bottom: 1px s
 th { font-size: 0.78rem; color: var(--muted); font-weight: 600; }
 
 .state-decoded, .trust-verified { color: var(--ok); font-weight: 600; }
-.state-need, .state-pending, .trust-unknown { color: var(--warn); }
+.state-receiving, .state-pending, .trust-unknown, .prec-priority { color: var(--warn); }
 .state-silent, .trust-unsigned { color: var(--muted); }
-.state-failed { color: var(--bad); font-weight: 600; }
+.state-failed, .prec-emergency { color: var(--bad); font-weight: 600; }
 
 .msgs { list-style: none; margin: 0; padding: 0; }
 .msgs li { padding: 0.65rem 0; border-bottom: 1px solid var(--rule); }

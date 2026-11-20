@@ -12,9 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::codec::MAX_OBJECT;
-use crate::frame::Mode;
+use crate::frame::{Mode, Precedence};
 use crate::keys;
-use crate::receiver::Trust;
+use crate::receiver::Announced;
 use crate::roster::Roster;
 use crate::sender::{Progress, State};
 use crate::station::{self, Inbox, Outgoing, Station, unix_now};
@@ -81,6 +81,7 @@ pub struct Incoming {
     pub from: String,
     pub mid: String,
     pub mode: &'static str,
+    pub precedence: &'static str,
     pub trust: &'static str,
     pub have: u32,
     pub k: u32,
@@ -94,28 +95,21 @@ fn find(inc: &mut [Incoming], id: u32) -> Option<&mut Incoming> {
     inc.iter_mut().find(|i| i.id == id)
 }
 
-pub fn announced(
-    inc: &mut Vec<Incoming>,
-    id: u32,
-    from: &str,
-    mid: &str,
-    mode: Mode,
-    trust: Trust,
-    k: u32,
-) {
-    if find(inc, id).is_some() {
+pub fn announced(inc: &mut Vec<Incoming>, a: &Announced) {
+    if find(inc, a.id).is_some() {
         return;
     }
     inc.insert(
         0,
         Incoming {
-            id: format!("{id:08x}"),
-            from: from.into(),
-            mid: mid.into(),
-            mode: mode.name(),
-            trust: trust.name(),
+            id: format!("{:08x}", a.id),
+            from: a.from.clone(),
+            mid: a.mid.clone(),
+            mode: a.mode.name(),
+            precedence: a.precedence.name(),
+            trust: a.trust.name(),
             have: 0,
-            k,
+            k: a.k,
             status: "receiving",
             subject: None,
             note: None,
@@ -154,6 +148,7 @@ pub struct Sending {
     pub id: String,
     pub mid: String,
     pub mode: &'static str,
+    pub precedence: &'static str,
     pub k: u32,
     pub signed: bool,
     pub recipients: Vec<(String, String)>,
@@ -169,6 +164,8 @@ pub struct SendForm {
     #[serde(default)]
     pub to: Vec<String>,
     pub mode: String,
+    /// Routine, welfare, priority or emergency; the mode's default when left out.
+    pub precedence: Option<String>,
     #[serde(default)]
     pub subject: String,
     #[serde(default)]
@@ -386,6 +383,7 @@ impl Ui {
                     id: String::new(),
                     mid: String::new(),
                     mode: out.mode.name(),
+                    precedence: out.precedence.name(),
                     k: 0,
                     signed: out.sign,
                     recipients: out
@@ -430,6 +428,10 @@ impl Ui {
             }
         };
         let mut out = Outgoing::new(b2f, to, mode, f.ack)?;
+        if let Some(p) = &f.precedence {
+            out.precedence =
+                Precedence::from_name(p).ok_or_else(|| anyhow!("unknown precedence {p:?}"))?;
+        }
         out.sign = f.sign;
         out.repeats = f.repeat.min(10);
         out.interval_s = f.interval_min.clamp(1, 24 * 60) * 60;
@@ -466,9 +468,10 @@ fn run_send(s: &Station, b: &Shared, out: Outgoing) {
                     snd.signed = signed;
                 }
                 b.log(format!(
-                    "sending {} ({}) to {}",
+                    "sending {} ({}, {}) to {}",
                     d.announce.mid,
                     d.announce.mode.name(),
+                    d.announce.precedence.name(),
                     d.announce.recipients.join(", ")
                 ));
             })
@@ -669,6 +672,24 @@ mod tests {
     }
 
     #[test]
+    fn the_form_picks_a_precedence_or_takes_the_modes() {
+        let u = ui(None);
+        let form = |extra: &str| -> SendForm {
+            serde_json::from_str(&format!(
+                r#"{{"to":["K1ABC"],"mode":"emergency","subject":"x","body":"y"{extra}}}"#
+            ))
+            .unwrap()
+        };
+        let p = |extra| u.outgoing(form(extra)).map(|o| o.precedence);
+        assert_eq!(p("").unwrap(), Precedence::Emergency);
+        assert_eq!(
+            p(r#","precedence":"welfare""#).unwrap(),
+            Precedence::Welfare
+        );
+        assert!(p(r#","precedence":"flash""#).is_err());
+    }
+
+    #[test]
     fn serves_the_page_with_its_token() {
         let u = ui(None);
         let r = u.handle(&Req {
@@ -774,15 +795,16 @@ mod tests {
         let long = "x".repeat(5000);
         assert_eq!(clean(&long, 120).len(), 123);
         let mut inc = vec![];
-        announced(
-            &mut inc,
-            1,
-            "N0NCS",
-            "MID1",
-            Mode::Bulletin,
-            Trust::Unsigned,
-            3,
-        );
+        let a = Announced {
+            id: 1,
+            mode: Mode::Bulletin,
+            precedence: Precedence::Routine,
+            from: "N0NCS".into(),
+            mid: "MID1".into(),
+            k: 3,
+            trust: crate::receiver::Trust::Unsigned,
+        };
+        announced(&mut inc, &a);
         decoded(&mut inc, 1, Some(long), None);
         assert_eq!(inc[0].subject.as_ref().unwrap().len(), 123);
     }

@@ -30,6 +30,10 @@ function stateClass(s) {
   return "state-" + s.split(" ")[0];
 }
 
+function precedenceClass(p) {
+  return p === "emergency" || p === "priority" ? "prec-" + p : "meta";
+}
+
 function trustClass(t) {
   if (t === "verified") return "trust-verified";
   if (t === "unsigned") return "trust-unsigned";
@@ -89,7 +93,7 @@ function showAir(snd) {
     air.replaceChildren(el("p", { class: "empty" }, "Nothing sent yet."));
     return;
   }
-  const bits = [snd.mode];
+  const bits = [snd.mode, snd.precedence];
   if (snd.signed) bits.push("signed");
   if (snd.k) bits.push(`${snd.k} symbols`);
   if (snd.round) bits.push(`status round ${snd.round}`);
@@ -115,6 +119,7 @@ function showIncoming(list, net) {
       el("span", { class: "from" }, m.from),
       el("span", {}, m.mid),
       el("span", { class: "meta" }, m.mode),
+      el("span", { class: precedenceClass(m.precedence) }, m.precedence),
       el("span", { class: trustClass(m.trust) }, m.trust));
     const parts = [top];
     if (m.subject) parts.push(el("p", { class: "subject" }, m.subject));
@@ -209,6 +214,7 @@ async function send(ev) {
   const form = {
     to: [...picked, ...typed],
     mode: $("mode").value,
+    precedence: $("precedence").value,
     ack: $("ack").checked,
     repeat: Number($("repeat").value) || 0,
     interval_min: Number($("interval").value) || 10,
@@ -245,7 +251,10 @@ async function send(ev) {
 }
 
 $("form").addEventListener("submit", send);
-$("mode").addEventListener("change", syncMode);
+$("mode").addEventListener("change", () => {
+  $("precedence").value = $("mode").value === "emergency" ? "emergency" : "routine";
+  syncMode();
+});
 $("ack").addEventListener("change", syncMode);
 $("repeat").addEventListener("input", syncMode);
 for (const r of document.querySelectorAll('input[name="source"]')) r.addEventListener("change", syncSource);

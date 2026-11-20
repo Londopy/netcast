@@ -2,7 +2,7 @@ use raptorq::{ObjectTransmissionInformation, PayloadId};
 
 pub const HEADER_LEN: usize = 12;
 const MAGIC: &[u8; 2] = b"NC";
-const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 
 /// Codec 1: brotli, then RFC 6330 RaptorQ.
 pub const CODEC_BROTLI_RAPTORQ: u8 = 1;
@@ -41,6 +41,50 @@ impl Mode {
     }
 }
 
+/// How urgent a message is, in the ARRL radiogram's terms. Independent of the
+/// mode: a bulletin can be a priority one, and emergency mode defaults to emergency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Precedence {
+    Routine = 0,
+    Welfare = 1,
+    Priority = 2,
+    Emergency = 3,
+}
+
+impl Precedence {
+    pub const ALL: [Precedence; 4] = [
+        Precedence::Routine,
+        Precedence::Welfare,
+        Precedence::Priority,
+        Precedence::Emergency,
+    ];
+
+    fn from_byte(b: u8) -> Option<Precedence> {
+        Precedence::ALL.get(b as usize).copied()
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Precedence::Routine => "routine",
+            Precedence::Welfare => "welfare",
+            Precedence::Priority => "priority",
+            Precedence::Emergency => "emergency",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Precedence> {
+        Precedence::ALL.into_iter().find(|p| p.name() == s)
+    }
+
+    /// What a mode gets unless the sender picks something else.
+    pub fn default_for(mode: Mode) -> Precedence {
+        match mode {
+            Mode::Emergency => Precedence::Emergency,
+            _ => Precedence::Routine,
+        }
+    }
+}
+
 /// What a delivery is: carried as its own small fountain-coded object.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Announce {
@@ -49,6 +93,7 @@ pub struct Announce {
     /// SHA-256 of the compressed message, so a signature covers the message too.
     pub hash: [u8; 32],
     pub mode: Mode,
+    pub precedence: Precedence,
     pub ttl_min: u16,
     pub from: String,
     pub mid: String,
@@ -63,6 +108,7 @@ impl Announce {
         b.extend_from_slice(&self.oti.serialize());
         b.extend_from_slice(&self.hash);
         b.push(self.mode as u8);
+        b.push(self.precedence as u8);
         b.extend_from_slice(&self.ttl_min.to_be_bytes());
         push_str(&mut b, &self.from);
         push_str(&mut b, &self.mid);
@@ -91,6 +137,7 @@ impl Announce {
         let oti = ObjectTransmissionInformation::deserialize(r.take(12)?.try_into().ok()?);
         let hash = r.take(32)?.try_into().ok()?;
         let mode = Mode::from_byte(r.u8()?)?;
+        let precedence = Precedence::from_byte(r.u8()?)?;
         let ttl_min = r.u16()?;
         let from = r.str().filter(|s| valid_name(s))?;
         let mid = r.str().filter(|m| crate::message::valid_mid(m))?;
@@ -108,6 +155,7 @@ impl Announce {
             oti,
             hash,
             mode,
+            precedence,
             ttl_min,
             from,
             mid,
@@ -224,6 +272,15 @@ impl Frame {
         b
     }
 
+    /// The protocol version of a netcast frame this build can't read, so a
+    /// listener can say why it hears a sender but decodes nothing.
+    pub fn other_version(b: &[u8]) -> Option<u8> {
+        match b {
+            [b'N', b'C', v, ..] if b.len() > HEADER_LEN && *v != VERSION => Some(*v),
+            _ => None,
+        }
+    }
+
     /// Anything that doesn't parse is someone else's traffic or noise, so it's just `None`.
     pub fn parse(b: &[u8]) -> Option<Frame> {
         let mut r = Reader(b);
@@ -337,6 +394,7 @@ mod tests {
             oti: ObjectTransmissionInformation::new(5000, 244, 1, 1, 4),
             hash: [7; 32],
             mode: Mode::Addressed,
+            precedence: Precedence::Priority,
             ttl_min: 60,
             from: "N0NCS".into(),
             mid: "ABCDEF123456".into(),
@@ -393,7 +451,7 @@ mod tests {
         };
         let b = f.encode();
         assert_eq!(b.len(), HEADER_LEN + 244);
-        assert_eq!(&b[..12], &[b'N', b'C', 1, 2, 1, 2, 3, 4, 0, 0, 0, 5]);
+        assert_eq!(&b[..12], &[b'N', b'C', 2, 2, 1, 2, 3, 4, 0, 0, 0, 5]);
     }
 
     #[test]
@@ -462,5 +520,42 @@ mod tests {
         assert_eq!(Frame::parse(&other_block), None);
         let a = announce().to_bytes();
         assert_eq!(Announce::parse(&a[..a.len() - 1]), None);
+    }
+
+    #[test]
+    fn unknown_precedence_is_refused() {
+        let mut b = announce().to_bytes();
+        // codec, OTI, hash, mode, then the precedence
+        let at = 1 + 12 + 32 + 1;
+        assert_eq!(b[at], Precedence::Priority as u8);
+        b[at] = 4;
+        assert_eq!(Announce::parse(&b), None);
+    }
+
+    #[test]
+    fn frames_from_another_version_are_named_not_parsed() {
+        let mut b = Frame::Symbol {
+            id: 1,
+            esi: 0,
+            data: vec![1],
+        }
+        .encode();
+        assert_eq!(Frame::other_version(&b), None);
+        b[2] = 1;
+        assert_eq!(Frame::parse(&b), None);
+        assert_eq!(Frame::other_version(&b), Some(1));
+        assert_eq!(Frame::other_version(b"NC"), None);
+    }
+
+    #[test]
+    fn emergency_mode_defaults_to_emergency_precedence() {
+        assert_eq!(
+            Precedence::default_for(Mode::Emergency),
+            Precedence::Emergency
+        );
+        assert_eq!(Precedence::default_for(Mode::Bulletin), Precedence::Routine);
+        for p in Precedence::ALL {
+            assert_eq!(Precedence::from_name(p.name()), Some(p));
+        }
     }
 }

@@ -1,4 +1,4 @@
-# netcast protocol, version 1
+# netcast protocol, version 2
 
 This is the on-air format netcast uses. It is published here, before any on-air use, so that
 anyone can decode a netcast transmission (47 CFR 97.309(a)(4)). Nothing in it is encrypted.
@@ -15,8 +15,10 @@ UI frame:
 - source: the transmitting station's callsign, which identifies the station in clear text
   in every frame (97.119)
 
-The largest frame is 256 bytes, so the symbol size is 244 bytes. Receivers listen only to frames
-sent to the net's address. Reports from receivers go to the same address.
+The largest frame is 256 bytes, so the symbol size is 244 bytes: what's left after the 12-byte
+header, which is already a multiple of 4. (The design notes netcast started from said 240,
+leaving room that nothing uses; 244 sends the same message in about 1.6% fewer frames.) Receivers
+listen only to frames sent to the net's address. Reports from receivers go to the same address.
 
 Over ARDOP (ardopcf in FEC mode), each netcast frame travels in one ARDOP FEC data frame:
 
@@ -50,13 +52,18 @@ Every frame starts with these 12 bytes:
 | Offset | Size | Field | Value |
 |---|---|---|---|
 | 0 | 2 | magic | `NC` (`0x4E 0x43`) |
-| 2 | 1 | version | `1` |
+| 2 | 1 | version | `2` |
 | 3 | 1 | type | 1 announce, 2 symbol, 3 status request, 4 report |
 | 4 | 4 | delivery ID | random and non-zero, picked by the sender for each delivery |
 | 8 | 4 | payload ID | RFC 6330 payload ID: source block number (1 byte, always 0), then ESI (3 bytes) |
 
 The payload ID holds the ESI of the symbol in announce and symbol frames. It is zero in status
-requests and reports. A frame with a non-zero source block number is not a netcast v1 frame.
+requests and reports. A frame with a non-zero source block number is not a netcast frame.
+
+Version 2 added the precedence byte to the announcement; netcast 0.1.0 spoke version 1. A
+station ignores frames of any other version. From 0.2.0 on it also says once that it is
+hearing them, so a station that upgraded can tell why it decodes nothing from one that
+hasn't. A 0.1.0 station says nothing, and a sender sees it as silent.
 
 ## The message object
 
@@ -97,6 +104,7 @@ Announcement layout:
 | 12 | RFC 6330 OTI for the message object (transfer length, symbol size, blocks, sub-blocks, alignment) |
 | 32 | SHA-256 of the message object (the compressed message) |
 | 1 | mode: 1 addressed, 2 bulletin, 3 emergency |
+| 1 | precedence, as on an ARRL radiogram: 0 routine, 1 welfare, 2 priority, 3 emergency. Emergency mode defaults to emergency, the others to routine |
 | 2 | TTL in minutes: how long receivers keep this delivery after they last hear it (receivers cap it at 24 hours) |
 | 1 + n | sender's callsign: a length byte, then n ASCII bytes |
 | 1 + n | MID: a length byte, then n ASCII bytes (1 to 12 letters and digits, not a Windows device name such as `NUL` or `COM1`) |
@@ -123,6 +131,11 @@ The signature is optional. It is an Ed25519 signature (RFC 8032) over these byte
 2. the delivery ID, 4 bytes
 3. the announcement, from the codec byte through the last recipient: everything except the
    signature length and the signature
+
+The prefix still says v1 in protocol version 2, on purpose: it names the signature scheme, which
+didn't change. A version 1 announcement can't be read as a version 2 one, because the bytes
+after the mode would put a length of 45 or more where the sender's callsign starts, and
+callsigns are at most 9 characters.
 
 The announcement carries the hash of the message, so the signature covers the message as well.
 The delivery ID is part of what's signed, so a signed announcement can't be replayed under a
@@ -156,15 +169,15 @@ What a signature doesn't cover:
   as a receipt.
 
 Known answer, for checking an implementation. Signing key seed: 32 bytes of `0x01`, delivery ID
-`0x01020304`, and an addressed announcement from `N0NCS` to `K1ABC`, MID `ABC123`, TTL 60, the
+`0x01020304`, and an addressed, routine announcement from `N0NCS` to `K1ABC`, MID `ABC123`, TTL 60, the
 hash 32 bytes of `0x01`, and an OTI for 1000 bytes in symbols of 244:
 
 ```text
 public key 8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c
 body       0100000003e80000f401000104010101010101010101010101010101010101010101010101
-           010101010101010101003c054e304e435306414243313233 01054b31414243
-signature  c031e185fa51601ced1672303a51c0652d57f4efc863a98d66cf0b83a2a3164bc612b7dd
-           3208d83f2e8dfbedd0f92f0d2a34196b3b52afc892cadaef732d9804
+           01010101010101010100003c054e304e43530641424331323301054b31414243
+signature  4d2da94f31b4bd5248f514d3d912a6b1080c006fc53058949e7ec8be7871ce62b6e1d3b7
+           68fab14100495edbed200a2bc8fdba89842a95a4118167c6d2cf6f0f
 ```
 
 The lines are wrapped for reading; join them without spaces.

@@ -17,9 +17,9 @@ station that missed the most, fills everyone's gaps at once.
 
 ```text
 > netcast send sitrep.txt --subject "Sitrep" --to K1ABC,W2XYZ,N3OOO --from N0NCS --net NET1 --baud 9600 --txdelay 50
-delivery 459d1845: J7CNWF489H0L (addressed), 12849 bytes compressed in 53 symbols, to K1ABC, W2XYZ, N3OOO
+delivery 459d1845: J7CNWF489H0L (addressed, routine), 12849 bytes compressed in 53 symbols, to K1ABC, W2XYZ, N3OOO
 queued the announcement and 59 symbols
-status round 1: K1ABC silent, W2XYZ need 15, N3OOO silent
+status round 1: K1ABC silent, W2XYZ receiving (needs 15), N3OOO silent
 queued the announcement and 17 symbols
 status round 2: K1ABC decoded, W2XYZ decoded, N3OOO silent
 queued the announcement and 0 symbols
@@ -174,6 +174,7 @@ netcast check --call K1ABC --net NET1 --roster net1.londopy
 | Option | Default | What it does |
 |---|---|---|
 | `--mode` | `addressed` | `addressed`, `bulletin` or `emergency` |
+| `--precedence` | `emergency` in emergency mode, else `routine` | `routine`, `welfare`, `priority` or `emergency`; shown on every receiving station |
 | `--margin` | 0.1 with acks, 0.5 without | extra repair symbols in each full pass, as a fraction of K |
 | `--rounds` | 3 | repair rounds, each followed by a status round |
 | `--ack` | off | ask for acknowledgements on an emergency message |
@@ -321,6 +322,10 @@ page itself knows. Another website open in the same browser can't send through i
 | Messages for named stations | `addressed` | yes; this is two-way exchange under 97.111(a)(1) |
 | Information bulletins for amateurs | `bulletin` | no; 97.111(b)(6) |
 | Emergency traffic | `emergency` | only with `--ack`; 97.111(b)(4) |
+
+Precedence is separate from the mode: a bulletin can go out as `priority`, and an emergency
+message defaults to `emergency`. Receivers show it in their log and on the web page; it doesn't
+change how the message is sent.
 
 Bulletins have to be of direct interest to the amateur service and meant only for amateurs, and
 keeping them that way is the operator's job. Netcast never encrypts anything. Every frame

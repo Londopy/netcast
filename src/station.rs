@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +12,7 @@ use rand::RngExt;
 
 use crate::ardop::{self, ArdopLink, FecMode};
 use crate::ax25::Addr;
-use crate::frame::{Frame, Mode};
+use crate::frame::{Frame, Mode, Precedence, VERSION};
 use crate::kiss::KissLink;
 use crate::link::{Channel, Link};
 use crate::pat::Stored;
@@ -138,6 +138,7 @@ pub struct Outgoing {
     pub b2f: Vec<u8>,
     pub to: Vec<String>,
     pub mode: Mode,
+    pub precedence: Precedence,
     pub sign: bool,
     pub acks: bool,
     pub margin: f64,
@@ -159,6 +160,7 @@ impl Outgoing {
             b2f,
             to,
             mode,
+            precedence: Precedence::default_for(mode),
             sign: false,
             acks,
             margin: if acks { 0.1 } else { 0.5 },
@@ -266,6 +268,7 @@ impl Station {
             from: self.call.to_string(),
             recipients: out.to.clone(),
             mode: out.mode,
+            precedence: out.precedence,
             ttl_min: out.ttl_min,
         };
         let d = Delivery::new(id, &out.b2f, env, self.radio.frame_max(), key)
@@ -335,6 +338,7 @@ impl Station {
             mailbox: inbox.mailbox,
             dir: self.dir.clone(),
             board,
+            other_versions: BTreeSet::new(),
         };
         l.say(format!(
             "listening on {} as {}, writing to {}",
@@ -391,6 +395,8 @@ struct Listener {
     mailbox: PathBuf,
     dir: PathBuf,
     board: Option<Shared>,
+    /// Protocol versions heard that this build can't read, each mentioned once.
+    other_versions: BTreeSet<u8>,
 }
 
 impl Listener {
@@ -443,7 +449,11 @@ impl Listener {
                 .map(|(t, _)| *t)
                 .min()
                 .map_or(poll, |t| t.min(poll));
-            if let Some(bytes) = link.recv_until(next)?
+            let heard = link.recv_until(next)?;
+            if let Some(bytes) = &heard {
+                self.check_version(bytes);
+            }
+            if let Some(bytes) = heard
                 && let Some(f) = Frame::parse(&bytes)
             {
                 let now = link.now_ms();
@@ -464,7 +474,9 @@ impl Listener {
                 if let Frame::Report { id, need, .. } = &f {
                     match need {
                         None => self.say(format!("delivery {id:08x}: reported decoded")),
-                        Some(n) => self.say(format!("delivery {id:08x}: reported need {n}")),
+                        Some(n) => {
+                            self.say(format!("delivery {id:08x}: reported needing {n} more"))
+                        }
                     }
                 }
                 link.send(&f.encode())?;
@@ -473,22 +485,32 @@ impl Listener {
         }
     }
 
+    /// Says once per version when netcast frames arrive that this build can't read.
+    fn check_version(&mut self, bytes: &[u8]) {
+        if let Some(v) = Frame::other_version(bytes)
+            && self.other_versions.insert(v)
+        {
+            self.warn(format!(
+                "hearing netcast frames in protocol version {v}, but this netcast {} speaks version {VERSION}; the sender and this station need releases that speak the same version",
+                env!("CARGO_PKG_VERSION")
+            ));
+        }
+    }
+
     fn on_output(&mut self, out: Output, now: u64) {
         match out {
-            Output::Announced {
-                id,
-                mode,
-                from,
-                mid,
-                k,
-                trust,
-            } => {
+            Output::Announced(a) => {
                 self.say(format!(
-                    "delivery {id:08x}: {mid} from {from} ({}, {}), {k} symbols",
-                    mode.name(),
-                    trust.name()
+                    "delivery {:08x}: {} from {} ({}, {}, {}), {} symbols",
+                    a.id,
+                    a.mid,
+                    a.from,
+                    a.mode.name(),
+                    a.precedence.name(),
+                    a.trust.name(),
+                    a.k
                 ));
-                self.update(|inc| ui::announced(inc, id, &from, &mid, mode, trust, k));
+                self.update(|inc| ui::announced(inc, &a));
             }
             Output::Report { at_ms, frame } => self.due.push((at_ms, frame)),
             Output::Decoded(d) => {
@@ -498,9 +520,10 @@ impl Listener {
                     let problem = match pat::deliver(&self.mailbox, call, &d.mid, &d.b2f, replace) {
                         Ok(Stored::New(path)) => {
                             self.say(format!(
-                                "decoded {} from {} ({}), wrote {}",
+                                "decoded {} from {} ({}, {}), wrote {}",
                                 d.mid,
                                 d.from,
+                                d.precedence.name(),
                                 d.trust.name(),
                                 path.display()
                             ));
@@ -605,6 +628,39 @@ mod tests {
         assert!(!o.acks && o.margin == 0.5);
         let o = Outgoing::new(vec![], vec![], Mode::Emergency, true).unwrap();
         assert!(o.acks);
+        assert_eq!(o.precedence, Precedence::Emergency);
+        let o = Outgoing::new(vec![], vec![], Mode::Addressed, false).unwrap();
+        assert_eq!(o.precedence, Precedence::Routine);
         assert!(Outgoing::new(vec![], vec![], Mode::Bulletin, true).is_err());
+    }
+
+    #[test]
+    fn another_protocol_version_is_mentioned_once() {
+        let board = Shared::default();
+        let mut l = Listener {
+            rx: Receiver::new(vec!["K1ABC".into()], vec![]),
+            due: vec![],
+            mailbox: PathBuf::new(),
+            dir: PathBuf::new(),
+            board: Some(board.clone()),
+            other_versions: BTreeSet::new(),
+        };
+        let mut old = Frame::Symbol {
+            id: 1,
+            esi: 0,
+            data: vec![1],
+        }
+        .encode();
+        l.check_version(&old);
+        old[2] = VERSION - 1;
+        l.check_version(&old);
+        l.check_version(&old);
+        let said = ui::edit(&board, |b| {
+            b.log
+                .iter()
+                .filter(|l| l.contains("protocol version"))
+                .count()
+        });
+        assert_eq!(said, 1);
     }
 }

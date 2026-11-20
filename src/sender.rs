@@ -4,7 +4,9 @@ use std::io;
 use ed25519_dalek::SigningKey;
 
 use crate::codec::{self, Object};
-use crate::frame::{Announce, CODEC_BROTLI_RAPTORQ, Frame, HEADER_LEN, Mode, valid_name};
+use crate::frame::{
+    Announce, CODEC_BROTLI_RAPTORQ, Frame, HEADER_LEN, Mode, Precedence, valid_name,
+};
 use crate::keys;
 use crate::link::{Channel, Link, idle};
 
@@ -76,6 +78,7 @@ pub struct Envelope {
     pub from: String,
     pub recipients: Vec<String>,
     pub mode: Mode,
+    pub precedence: Precedence,
     pub ttl_min: u16,
 }
 
@@ -141,6 +144,7 @@ impl Delivery {
             oti: payload.oti(),
             hash: codec::hash(&packed),
             mode: env.mode,
+            precedence: env.precedence,
             ttl_min: env.ttl_min,
             from: env.from,
             mid,
