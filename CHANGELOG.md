@@ -8,6 +8,34 @@ what appears on its GitHub release page. Validated in CI by
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-19
+
+### Changed
+
+- The on-air format is now version 2, with a precedence in the announcement. 0.1.0 stations
+  can't hear 0.2.0 ones or the other way round, so upgrade every station on a net together.
+- `netcast upgrade` asks before installing; `--yes` skips the question for scripts. It also
+  checks that it can write the program's folder before asking.
+- `silent` now means a station the sender never heard from during the delivery.
+- The simulator's test messages no longer have random MIDs, so its results repeat exactly.
+
+### Added
+
+- A precedence on every message (routine, welfare, priority or emergency, as on a radiogram),
+  set with `send --precedence` or on the web page, and shown in each receiving station's log
+  and web page. Emergency mode defaults to emergency.
+- The sender's table shows stations that are still receiving, with how many symbols they need.
+- A 0.2.0 listener that hears netcast frames of another protocol version says so once.
+- `docs/patents.md`: what Qualcomm's IPR declarations for RaptorQ say, and what is still open.
+
+### Fixed
+
+- A station whose reports stopped getting through after round 1 was marked silent, and if it
+  was the only one still short, no more repair was sent for it. The sender now keeps it as
+  receiving and sizes the next repair from what it probably still misses, for up to two
+  missed polls in a row.
+- One forged report claiming a huge need could make the sender queue tens of thousands of
+  repair symbols. A report now counts for at most the whole message.
 ## [0.1.0] - 2026-11-19
 
 ### Added
@@ -42,5 +70,6 @@ what appears on its GitHub release page. Validated in CI by
 - The web page shows recent sent and received deliveries, and takes the gap between bulletin
   repeats.
 
-[Unreleased]: https://github.com/Londopy/netcast/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Londopy/netcast/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Londopy/netcast/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Londopy/netcast/releases/tag/v0.1.0
