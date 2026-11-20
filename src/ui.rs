@@ -566,21 +566,24 @@ fn read_request(r: &mut tiny_http::Request) -> Result<Req> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::station::Radio;
+    use crate::station::{Radio, Transport};
 
     fn ui(outbox: Option<PathBuf>) -> Ui {
-        let station = Station {
-            call: "N0NCS".parse().unwrap(),
-            net: "NET1".parse().unwrap(),
-            radio: Radio {
-                kiss: "127.0.0.1:1".into(),
+        let radio = Radio {
+            transport: Transport::Kiss {
+                addr: "127.0.0.1:1".into(),
                 baud: 1200,
                 txdelay_ms: 300,
-                guard_ms: 500,
             },
-            dir: std::env::temp_dir(),
-            key: None,
+            guard_ms: 500,
         };
+        let station = Station::new(
+            "N0NCS".parse().unwrap(),
+            "NET1".parse().unwrap(),
+            radio,
+            std::env::temp_dir(),
+            None,
+        );
         Ui::new(station, None, outbox, 8740)
     }
 

@@ -1,5 +1,8 @@
 use std::collections::HashMap;
+use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -7,6 +10,7 @@ use anyhow::{Result, anyhow, bail};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::RngExt;
 
+use crate::ardop::{self, ArdopLink, FecMode};
 use crate::ax25::Addr;
 use crate::frame::{Frame, Mode};
 use crate::kiss::KissLink;
@@ -22,6 +26,7 @@ use crate::{history, message, pat};
 pub const AX25_FRAME_MAX: usize = 256;
 const RETRY_MIN: Duration = Duration::from_secs(5);
 const RETRY_MAX: Duration = Duration::from_secs(60);
+const STALE_REPORT_MS: u64 = 2_000;
 // how long a decoded delivery id is refused if it's heard again, so a recording
 // played back later doesn't land as a new message
 const REPLAY_WINDOW_S: u64 = 7 * 86400;
@@ -32,18 +37,84 @@ pub fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// How to reach the radio, and its timing.
+/// How this station reaches its radio.
+#[derive(Clone)]
+pub enum Transport {
+    /// Direwolf or another KISS TNC, sending AX.25 UI frames.
+    Kiss {
+        addr: String,
+        baud: u32,
+        txdelay_ms: u64,
+    },
+    /// ardopcf in FEC mode. `mode` is the frame type messages go out in.
+    Ardop { addr: String, mode: FecMode },
+}
+
 #[derive(Clone)]
 pub struct Radio {
-    pub kiss: String,
-    pub baud: u32,
-    pub txdelay_ms: u64,
+    pub transport: Transport,
     pub guard_ms: u64,
 }
 
 impl Radio {
-    fn channel(&self) -> Channel {
-        Channel::new(self.baud, self.txdelay_ms)
+    /// A link for sending messages, or with `answering` for listening and answering
+    /// status requests.
+    fn connect(
+        &self,
+        me: &Addr,
+        net: &Addr,
+        answering: bool,
+        start: Instant,
+    ) -> io::Result<Box<dyn Link>> {
+        Ok(match &self.transport {
+            Transport::Kiss {
+                addr,
+                baud,
+                txdelay_ms,
+            } => {
+                let ch = Channel::new(*baud, *txdelay_ms);
+                Box::new(KissLink::connect(addr, me.clone(), net.clone(), ch, start)?)
+            }
+            Transport::Ardop { addr, mode } => {
+                let mode = if answering { ardop::REPORT_MODE } else { *mode };
+                Box::new(ArdopLink::connect(addr, me, mode, start)?)
+            }
+        })
+    }
+
+    fn frame_max(&self) -> usize {
+        match &self.transport {
+            Transport::Kiss { .. } => AX25_FRAME_MAX,
+            Transport::Ardop { mode, .. } => ardop::frame_max(*mode),
+        }
+    }
+
+    /// Report slot length and the wait before the first slot.
+    fn slots(&self) -> (u16, u16) {
+        match &self.transport {
+            Transport::Kiss {
+                baud, txdelay_ms, ..
+            } => {
+                let ch = Channel::new(*baud, *txdelay_ms);
+                (sender::slot_ms(&ch, self.guard_ms), 0)
+            }
+            Transport::Ardop { .. } => {
+                let slot = (ardop::REPORT_MS + self.guard_ms).min(u16::MAX as u64) as u16;
+                (slot, ardop::LEAD_MS)
+            }
+        }
+    }
+
+    fn describe(&self) -> String {
+        match &self.transport {
+            Transport::Kiss { addr, .. } => format!("the KISS TNC at {addr}"),
+            Transport::Ardop { addr, .. } => format!("ardopcf at {addr}"),
+        }
+    }
+
+    /// ardopcf takes one host connection at a time; Direwolf takes any number.
+    fn exclusive(&self) -> bool {
+        matches!(self.transport, Transport::Ardop { .. })
     }
 }
 
@@ -54,6 +125,9 @@ pub struct Station {
     pub radio: Radio,
     pub dir: PathBuf,
     pub key: Option<SigningKey>,
+    // with an ardopcf link, sending and listening take turns on the one connection
+    tnc: Mutex<()>,
+    yield_tnc: AtomicBool,
 }
 
 /// A message ready to send, and how to send it.
@@ -125,6 +199,35 @@ pub fn recipients(to: &[String], roster: Option<&Roster>, me: &Addr) -> Result<V
 }
 
 impl Station {
+    pub fn new(
+        call: Addr,
+        net: Addr,
+        radio: Radio,
+        dir: PathBuf,
+        key: Option<SigningKey>,
+    ) -> Station {
+        Station {
+            call,
+            net,
+            radio,
+            dir,
+            key,
+            tnc: Mutex::new(()),
+            yield_tnc: AtomicBool::new(false),
+        }
+    }
+
+    /// Takes the TNC from the listener when only one connection is allowed.
+    fn claim_tnc(&self) -> Option<MutexGuard<'_, ()>> {
+        if !self.radio.exclusive() {
+            return None;
+        }
+        self.yield_tnc.store(true, Ordering::SeqCst);
+        let guard = self.tnc.lock().unwrap_or_else(|e| e.into_inner());
+        self.yield_tnc.store(false, Ordering::SeqCst);
+        Some(guard)
+    }
+
     /// Sends one message, logs the outcome, and returns each recipient's final state.
     /// `started` sees the delivery once it's encoded, before anything goes on the air.
     pub fn send(
@@ -148,27 +251,25 @@ impl Station {
             mode: out.mode,
             ttl_min: out.ttl_min,
         };
-        let d =
-            Delivery::new(id, &out.b2f, env, AX25_FRAME_MAX, key).map_err(anyhow::Error::msg)?;
-        let ch = self.radio.channel();
+        let d = Delivery::new(id, &out.b2f, env, self.radio.frame_max(), key)
+            .map_err(anyhow::Error::msg)?;
+        let (slot_ms, lead_ms) = self.radio.slots();
         let plan = Plan {
             margin: out.margin,
             rounds: out.rounds,
             acks: out.acks,
             repeats: if out.acks { 0 } else { out.repeats },
             repeat_gap_ms: out.interval_s * 1000,
-            slot_ms: sender::slot_ms(&ch, self.radio.guard_ms),
+            slot_ms,
+            lead_ms,
             guard_ms: self.radio.guard_ms,
         };
-        let mut link = KissLink::connect(
-            &self.radio.kiss,
-            self.call.clone(),
-            self.net.clone(),
-            ch,
-            Instant::now(),
-        )?;
+        let _tnc = self.claim_tnc();
+        let mut link = self
+            .radio
+            .connect(&self.call, &self.net, false, Instant::now())?;
         started(&d);
-        let states = sender::run(&mut link, &d, &plan, progress)?;
+        let states = sender::run(&mut *link, &d, &plan, progress)?;
         let outcome: Vec<(String, String)> = out
             .to
             .iter()
@@ -228,22 +329,24 @@ impl Station {
         let start = Instant::now();
         let mut backoff = RETRY_MIN;
         loop {
-            let ch = self.radio.channel();
-            match KissLink::connect(
-                &self.radio.kiss,
-                reply_as.clone(),
-                self.net.clone(),
-                ch,
-                start,
-            ) {
+            while self.yield_tnc.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(200));
+            }
+            let held = self
+                .radio
+                .exclusive()
+                .then(|| self.tnc.lock().unwrap_or_else(|e| e.into_inner()));
+            match self.radio.connect(&reply_as, &self.net, true, start) {
                 Ok(mut link) => {
                     backoff = RETRY_MIN;
-                    l.tnc(format!("connected to the TNC at {}", self.radio.kiss), true);
-                    if let Err(e) = l.serve(&mut link) {
-                        l.tnc(format!("lost the KISS connection: {e}"), false);
+                    l.tnc(format!("connected to {}", self.radio.describe()), true);
+                    match l.serve(&mut *link, &self.yield_tnc) {
+                        Ok(()) => l.tnc("handed the TNC over for sending".into(), true),
+                        Err(e) => l.tnc(format!("lost the TNC connection: {e}"), false),
                     }
                 }
                 Err(e) => {
+                    drop(held);
                     l.tnc(
                         format!("{e}; trying again in {} s", backoff.as_secs()),
                         false,
@@ -305,15 +408,24 @@ impl Listener {
         }
     }
 
-    /// Runs until the link fails.
-    fn serve(&mut self, link: &mut KissLink) -> std::io::Result<()> {
+    /// Runs until the link fails, or until `stop` asks for the TNC back.
+    fn serve(&mut self, link: &mut dyn Link, stop: &AtomicBool) -> io::Result<()> {
+        // a report whose slot went by while the TNC was handed over would only
+        // land on top of someone else's
+        let now = link.now_ms();
+        self.due.retain(|(t, _)| *t + STALE_REPORT_MS >= now);
         loop {
+            if stop.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            // wake at least once a second, so a send waiting for the TNC isn't kept waiting
+            let poll = link.now_ms() + 1000;
             let next = self
                 .due
                 .iter()
                 .map(|(t, _)| *t)
                 .min()
-                .unwrap_or(link.now_ms() + 1000);
+                .map_or(poll, |t| t.min(poll));
             if let Some(bytes) = link.recv_until(next)?
                 && let Some(f) = Frame::parse(&bytes)
             {

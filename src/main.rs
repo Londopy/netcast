@@ -1,3 +1,4 @@
+mod ardop;
 mod ax25;
 mod codec;
 mod frame;
@@ -21,11 +22,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use ardop::FecMode;
 use ax25::Addr;
 use frame::Mode;
 use roster::Roster;
 use sender::{Progress, State};
-use station::{AX25_FRAME_MAX, Inbox, Outgoing, Radio, Station, unix_now};
+use station::{AX25_FRAME_MAX, Inbox, Outgoing, Radio, Station, Transport, unix_now};
 
 #[derive(Parser)]
 #[command(
@@ -60,8 +62,6 @@ enum Cmd {
         /// Subject, needed when the file is plain text.
         #[arg(long)]
         subject: Option<String>,
-        #[arg(long, value_enum, default_value_t = Via::Direwolf)]
-        via: Via,
         #[arg(long, value_enum, default_value_t = ModeArg::Addressed)]
         mode: ModeArg,
         /// Extra symbols in each full pass, as a fraction of the message
@@ -197,6 +197,9 @@ struct RadioArgs {
     /// Taken from the roster if not given.
     #[arg(long)]
     net: Option<String>,
+    /// Which TNC carries the net.
+    #[arg(long, value_enum, default_value_t = Via::Direwolf)]
+    via: Via,
     /// Direwolf's KISS TCP port.
     #[arg(long, default_value = "127.0.0.1:8001")]
     kiss: String,
@@ -205,6 +208,12 @@ struct RadioArgs {
     /// Must match TXDELAY in direwolf.conf, in milliseconds.
     #[arg(long, default_value_t = 300)]
     txdelay: u64,
+    /// ardopcf's command port; its data port is the next one up.
+    #[arg(long, default_value = "127.0.0.1:8515")]
+    ardop: String,
+    /// The ardopcf FEC frame type messages go out in.
+    #[arg(long, default_value = "4FSK.500.100", value_parser = fec_mode)]
+    fecmode: FecMode,
     /// Slack added to each report slot, in milliseconds.
     #[arg(long, default_value_t = 500)]
     guard: u64,
@@ -216,9 +225,20 @@ fn baud() -> clap::builder::RangedI64ValueParser<u32> {
     clap::value_parser!(u32).range(300..=1_000_000)
 }
 
+fn fec_mode(s: &str) -> Result<FecMode, String> {
+    ardop::mode(s).ok_or_else(|| {
+        let names: Vec<&str> = ardop::MODES.iter().map(|m| m.name).collect();
+        format!(
+            "not an FEC mode netcast can use; pick one of {}",
+            names.join(", ")
+        )
+    })
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum Via {
     Direwolf,
+    Ardop,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -266,7 +286,6 @@ fn run(cli: Cli) -> Result<bool> {
             to,
             from,
             subject,
-            via: Via::Direwolf,
             mode,
             margin,
             rounds,
@@ -397,18 +416,22 @@ fn station(call: Addr, radio: RadioArgs, roster: Option<&Roster>) -> Result<Stat
         eprintln!("netcast: not using the station key: {e:#}");
         None
     });
-    Ok(Station {
-        call,
-        net,
-        radio: Radio {
-            kiss: radio.kiss,
+    let transport = match radio.via {
+        Via::Direwolf => Transport::Kiss {
+            addr: radio.kiss,
             baud: radio.baud,
             txdelay_ms: radio.txdelay,
-            guard_ms: radio.guard,
         },
-        dir,
-        key,
-    })
+        Via::Ardop => Transport::Ardop {
+            addr: radio.ardop,
+            mode: radio.fecmode,
+        },
+    };
+    let radio = Radio {
+        transport,
+        guard_ms: radio.guard,
+    };
+    Ok(Station::new(call, net, radio, dir, key))
 }
 
 fn inbox_for(args: InboxArgs, st: &Station, roster: Option<&Roster>) -> Result<Inbox> {
