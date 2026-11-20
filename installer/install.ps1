@@ -159,6 +159,10 @@ function Install-App {
     }
     Write-Host "$AppName $($release.tag_name) for $arch -> $($pick.Name)"
     if ($DryRun) { return $pick }
+    # closing it here could cut a delivery off halfway, so leave that to the user
+    if (Get-Process -Name $AppName -ErrorAction SilentlyContinue) {
+        throw "$AppName is running (a listener or the web page?). Stop it and run this again."
+    }
 
     $sums = Get-ChecksumTable -Release $release
     $file = Save-Verified -Release $release -Name $pick.Name -Sums $sums
@@ -168,7 +172,7 @@ function Install-App {
             $scope = '/CURRENTUSER'
             if ($AllUsers) { $scope = '/ALLUSERS' }
             $p = Start-Process -FilePath $file -Wait -PassThru -ArgumentList @(
-                '/SILENT', '/SP-', '/SUPPRESSMSGBOXES', '/NORESTART', '/CLOSEAPPLICATIONS', $scope)
+                '/SILENT', '/SP-', '/SUPPRESSMSGBOXES', '/NORESTART', $scope)
             if ($p.ExitCode -ne 0) { throw "Setup exited with code $($p.ExitCode)." }
         }
         'msi' {

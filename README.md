@@ -86,9 +86,9 @@ downloads; pick whichever you like. The installer, the MSI and `install.ps1` put
 | `netcast-<version>-x64.msi` (also `x86`, `arm64`) | MSI installer. Per-user by default; IT can deploy it machine-wide. |
 | `netcast-v<version>-x64-portable.exe` (also `x86`, `arm64`) | One exe, nothing to install. |
 | `netcast-v<version>-portable.zip` | All three Windows builds; netcast keeps its key and logs next to the exe. |
-| `netcast-v<version>-linux-x64` (also `linux-arm64`) | Linux binary, for example on a Raspberry Pi next to the radio. |
+| `netcast-v<version>-linux-x64` (also `linux-arm64`) | Linux binary, 64-bit, glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Raspberry Pi OS bookworm). |
 | `install.ps1` / `install.cmd` | Script install that picks the right build and checks its SHA-256. |
-| `<file>.torrent` / magnet link | Any of the above over BitTorrent; downloads straight from GitHub even with no seeders. |
+| `<file>.torrent` / magnet link | Any of the above but the scripts, over BitTorrent. A `.torrent` downloads from GitHub even with no seeders; a magnet link needs one peer to start. |
 
 **PowerShell one-liner:**
 

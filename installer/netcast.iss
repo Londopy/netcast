@@ -72,8 +72,9 @@ ArchitecturesInstallIn64BitMode=x64compatible
 WizardStyle=modern
 
 ; Restart Manager offers to close a running copy (a listener, the web page)
-; before its files are replaced. It asks first: killing netcast silently could
-; cut a delivery off halfway.
+; before its files are replaced. The wizard asks first; install.ps1 runs setup
+; silently, so it refuses to start while netcast is running instead, since
+; closing it could cut a delivery off halfway.
 CloseApplications=yes
 CloseApplicationsFilter=*.exe
 RestartApplications=no

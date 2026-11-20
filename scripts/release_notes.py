@@ -267,7 +267,8 @@ def main():
     linux = find(r"-linux-x64$")
     if linux:
         out += [f"**Linux:** download [`{linux}`]({download}/{linux}) (or the arm64 build), then:", "",
-                "```sh", f"chmod +x {linux}", f"sudo mv {linux} /usr/local/bin/netcast", "```", ""]
+                "```sh", "mkdir -p ~/.local/bin", f"chmod +x {linux}", f"mv {linux} ~/.local/bin/netcast", "```", "",
+                "Somewhere your own user can write lets `netcast upgrade` replace it later without sudo.", ""]
 
     out += ["## Verify a download", "",
             "`SHA256SUMS.txt` lists the SHA-256 of every file on this release. In PowerShell, next to the download:", "",
