@@ -199,8 +199,10 @@ received the request. A station that has already reported `decoded` is not polle
 A station answers each round once, however many copies of the request it hears, and ignores
 lead times and slot lengths over 10 seconds.
 
-The lead time leaves room for anything the sender's TNC may still send after the request. Over
-AX.25 it is 0. Over ARDOP it is 2300 ms: when the request is the first frame of a transmission,
+The lead time leaves room for anything the sender's TNC may still send after the request, and
+for the sender's radio to get back on receive. Over AX.25 it is TXDELAY plus the guard: without
+it, the first station's answer ran into the end of the sender's own transmission. Over ARDOP it
+is 2300 ms: when the request is the first frame of a transmission,
 ardopcf follows it with a 1.8-second ID frame, and a station that answered straight away would
 talk over it.
 

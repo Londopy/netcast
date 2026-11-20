@@ -96,7 +96,11 @@ impl Radio {
                 baud, txdelay_ms, ..
             } => {
                 let ch = Channel::new(*baud, *txdelay_ms);
-                (sender::slot_ms(&ch, self.guard_ms), 0)
+                // the sender's TNC is still sending its closing flags, and its radio
+                // still switching back to receive, when a station decodes the
+                // request; an answer right away runs into that
+                let lead = (txdelay_ms + self.guard_ms).min(u16::MAX as u64) as u16;
+                (sender::slot_ms(&ch, self.guard_ms), lead)
             }
             Transport::Ardop { .. } => {
                 let slot = (ardop::REPORT_MS + self.guard_ms).min(u16::MAX as u64) as u16;
