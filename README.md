@@ -1,9 +1,12 @@
 # netcast
 
 [![CI](https://github.com/Londopy/netcast/actions/workflows/ci.yml/badge.svg)](https://github.com/Londopy/netcast/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Londopy/netcast)](https://github.com/Londopy/netcast/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/Londopy/netcast/total)](https://github.com/Londopy/netcast/releases)
 [![changelog](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/Londopy/netcast/gh-pages/changelog-badge.json)](CHANGELOG.md)
 [![License](https://img.shields.io/github/license/Londopy/netcast)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange)](https://www.rust-lang.org)
+[![Platforms](https://img.shields.io/badge/platform-Windows%2010%2B%20%7C%20Linux-0078D6)](#install)
 
 **Send a bulletin to every station on the net in one go, instead of once per station.**
 
@@ -74,8 +77,59 @@ timers. Run `netcast sim --help` to try other nets.
 
 ## Install
 
-There are no releases yet. Build it from source (below). The Windows installer and portable
-builds will come with the first release.
+Every [release](https://github.com/Londopy/netcast/releases/latest) has the same set of
+downloads; pick whichever you like. The installer, the MSI and `install.ps1` put `netcast` on your PATH; the portable and Linux files are just the program.
+
+| Download | What it is |
+|---|---|
+| `netcast-<version>-setup-x64.exe` | **Installer (recommended).** Per-user, no admin prompt. |
+| `netcast-<version>-x64.msi` (also `x86`, `arm64`) | MSI installer. Per-user by default; IT can deploy it machine-wide. |
+| `netcast-v<version>-x64-portable.exe` (also `x86`, `arm64`) | One exe, nothing to install. |
+| `netcast-v<version>-portable.zip` | All three Windows builds; netcast keeps its key and logs next to the exe. |
+| `netcast-v<version>-linux-x64` (also `linux-arm64`) | Linux binary, for example on a Raspberry Pi next to the radio. |
+| `install.ps1` / `install.cmd` | Script install that picks the right build and checks its SHA-256. |
+| `<file>.torrent` / magnet link | Any of the above over BitTorrent; downloads straight from GitHub even with no seeders. |
+
+**PowerShell one-liner:**
+
+```powershell
+irm https://github.com/Londopy/netcast/releases/latest/download/install.ps1 | iex
+```
+
+Options: `-Msi`, `-Portable`, `-AllUsers`, `-Version 0.1.0`, `-NoPath`. To pass them, run the
+script as a block: `& ([scriptblock]::Create((irm https://github.com/Londopy/netcast/releases/latest/download/install.ps1))) -Portable`
+
+**MSI for every user** (admin): `msiexec /i netcast-<version>-x64.msi ALLUSERS=2 MSIINSTALLPERUSER=""`.
+
+**Linux:**
+
+```sh
+mkdir -p ~/.local/bin
+chmod +x netcast-v<version>-linux-x64
+mv netcast-v<version>-linux-x64 ~/.local/bin/netcast
+```
+
+Somewhere your own user can write, like `~/.local/bin`, lets `netcast upgrade` replace it
+later without sudo.
+
+The binaries are not code-signed, so Windows SmartScreen may warn on first run (**More info**,
+then **Run anyway**). Every release ships `SHA256SUMS.txt`; check a download with:
+
+```powershell
+(Get-FileHash .\<file> -Algorithm SHA256).Hash
+```
+
+`netcast upgrade` installs a newer release once one is out, after checking it against that
+release's `SHA256SUMS.txt`, and `netcast upgrade --check` only says whether there is one. The
+everyday commands also print a one-line notice when a newer release exists, checking GitHub at
+most once a day; set `NETCAST_NO_UPDATE_CHECK=1` to turn that off. The new version is test-run
+before it replaces the old one, so a download that won't start here changes nothing. An
+all-users install in Program Files can't replace itself: run the new installer instead. A
+listener or web page that's already running keeps the old version until you restart it.
+
+netcast keeps its station key and logs in `%LOCALAPPDATA%\netcast` on Windows and
+`~/.local/state/netcast` on Linux. An empty file named `portable` next to the exe keeps them in
+that folder instead. Uninstalling leaves that folder alone, so the key survives a reinstall.
 
 ## Usage
 
@@ -260,7 +314,8 @@ cargo test
 
 - `ofm`'s connectionless port, which waits on `ofm` itself
 - A test with real radios, Direwolf or ardopcf on the air
-- Opening `.londopy` rosters by double-clicking them in Explorer, which comes with the installer
+- Opening `.londopy` rosters by double-clicking them in Explorer
+- winget and Scoop packages
 - Winlink Express inboxes, since Express keeps its own message store
 
 ## Patents
@@ -292,7 +347,11 @@ src/
   keys.rs       the station key and announcement signatures
   roster.rs     the net roster
   londopy.rs    reading and writing .londopy files
+  upgrade.rs    netcast upgrade and the daily update notice
 ui/             the web page: HTML, CSS and JS, built into the binary
+installer/      Inno Setup and WiX scripts, install.ps1 and install.cmd
+scripts/        release_notes.py: release page, checksums, torrents
+assets/         the icon
 docs/
   protocol.md   the on-air format
 ```
