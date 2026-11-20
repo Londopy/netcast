@@ -221,6 +221,20 @@ impl Station {
         }
     }
 
+    /// Connects to the TNC the way a listener would, and lets go again. Says
+    /// which TNC answered, or `None` when it wasn't tried: ardopcf hands itself
+    /// to the newest connection, so a probe would cut off a running listener.
+    pub fn try_tnc(&self) -> io::Result<Option<String>> {
+        if self.radio.exclusive() {
+            return Ok(None);
+        }
+        let link = self
+            .radio
+            .connect(&self.call, &self.net, true, Instant::now())?;
+        drop(link);
+        Ok(Some(self.radio.describe()))
+    }
+
     /// Takes the TNC from the listener when only one connection is allowed.
     fn claim_tnc(&self) -> Option<MutexGuard<'_, ()>> {
         if !self.radio.exclusive() {

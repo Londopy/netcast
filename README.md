@@ -163,6 +163,14 @@ A `.b2f` file goes out as it is. Anything else is sent as a plain text body, and
 `netcast status` shows what this station has sent and received. The listener reconnects by
 itself when Direwolf restarts, and decoded messages show up in Pat as unread.
 
+Before a net, `netcast check` goes down the list: the state folder, the station key, the roster,
+Pat's mailbox, and whether the TNC answers. Each line says `ok`, `note` or `problem`, and it
+exits with status 1 if anything is a problem:
+
+```text
+netcast check --call K1ABC --net NET1 --roster net1.londopy
+```
+
 | Option | Default | What it does |
 |---|---|---|
 | `--mode` | `addressed` | `addressed`, `bulletin` or `emergency` |

@@ -106,6 +106,20 @@ enum Cmd {
         #[command(flatten)]
         radio: RadioArgs,
     },
+    /// Check this station is ready for a net: its folder, key, roster, Pat mailbox and TNC.
+    Check {
+        /// This station's callsign.
+        #[arg(long)]
+        call: String,
+        /// The net roster, if there is one.
+        #[arg(long)]
+        roster: Option<PathBuf>,
+        /// Pat's mailbox folder. Read from `pat env` if not given.
+        #[arg(long)]
+        mailbox: Option<PathBuf>,
+        #[command(flatten)]
+        radio: RadioArgs,
+    },
     /// Make this station's signing key, or show its public half.
     Key {
         #[arg(long)]
@@ -354,6 +368,12 @@ fn run(cli: Cli) -> Result<bool> {
             ui::Ui::new(st, roster, outbox, port).run(inbox)?;
             Ok(true)
         }
+        Cmd::Check {
+            call,
+            roster,
+            mailbox,
+            radio,
+        } => Ok(check(&call, roster.as_deref(), mailbox, radio)),
         Cmd::Key { state_dir } => {
             let dir = state_dir.unwrap_or_else(history::default_dir);
             let existed = keys::load(&dir)?.is_some();
@@ -409,6 +429,111 @@ fn run(cli: Cli) -> Result<bool> {
             Ok(true)
         }
     }
+}
+
+/// `netcast check`: one line per thing a net needs, true when nothing is wrong.
+fn check(call: &str, roster: Option<&Path>, mailbox: Option<PathBuf>, radio: RadioArgs) -> bool {
+    let mut ok = true;
+    let mut line = |good: Option<bool>, text: String| {
+        let tag = match good {
+            Some(true) => "ok",
+            Some(false) => "problem",
+            None => "note",
+        };
+        ok &= good != Some(false);
+        println!("{tag:<8} {text}");
+    };
+    let call: Addr = match call.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            line(Some(false), e);
+            return false;
+        }
+    };
+    let dir = radio.state_dir.clone().unwrap_or_else(history::default_dir);
+    let probe = dir.join(".netcast-check");
+    let writable = fs::create_dir_all(&dir)
+        .and_then(|_| fs::write(&probe, b""))
+        .and_then(|_| fs::remove_file(&probe));
+    match writable {
+        Ok(()) => line(Some(true), format!("state folder {}", dir.display())),
+        Err(e) => line(
+            Some(false),
+            format!("can't write to the state folder {}: {e}", dir.display()),
+        ),
+    }
+    match keys::load(&dir) {
+        Ok(Some(k)) => line(
+            Some(true),
+            format!(
+                "station key, public half {}",
+                keys::hex(k.verifying_key().as_bytes())
+            ),
+        ),
+        Ok(None) => line(
+            None,
+            "no station key; run `netcast key` before signing anything".into(),
+        ),
+        Err(e) => line(Some(false), format!("{e:#}")),
+    }
+    let mut roster_failed = false;
+    let roster = match roster.map(Roster::load).transpose() {
+        Ok(Some(r)) => {
+            let with_keys = r.members.iter().filter(|m| m.key.is_some()).count();
+            let listed = r.members.iter().any(|m| m.call == call.to_string());
+            line(
+                Some(true),
+                format!(
+                    "roster for {}: {} members ({with_keys} with keys), {} groups",
+                    r.net,
+                    r.members.len(),
+                    r.groups.len()
+                ),
+            );
+            if !listed {
+                line(None, format!("{call} isn't a member of this roster"));
+            }
+            Some(r)
+        }
+        Ok(None) => {
+            line(None, "no roster given".into());
+            None
+        }
+        Err(e) => {
+            line(Some(false), format!("{e:#}"));
+            roster_failed = true;
+            None
+        }
+    };
+    let mailbox = match mailbox {
+        Some(m) => Ok(m),
+        None => pat::mailbox(),
+    };
+    match mailbox {
+        Ok(m) if m.is_dir() => line(Some(true), format!("Pat mailbox {}", m.display())),
+        Ok(m) => line(
+            Some(false),
+            format!(
+                "Pat's mailbox {} doesn't exist yet; run Pat once first",
+                m.display()
+            ),
+        ),
+        Err(e) => line(Some(false), format!("{e}")),
+    }
+    match station(call, radio, roster.as_ref()) {
+        Ok(st) => match st.try_tnc() {
+            Ok(Some(tnc)) => line(Some(true), format!("reached {tnc} for net {}", st.net)),
+            Ok(None) => line(
+                None,
+                "ardopcf not tried: it takes one program at a time, and connecting would cut off a running netcast".into(),
+            ),
+            Err(e) => line(Some(false), format!("{e}")),
+        },
+        // a roster or key problem above already explains this one
+        Err(_) if roster_failed => {}
+        Err(e) => line(Some(false), format!("{e:#}")),
+    }
+    ok
 }
 
 fn load_roster(path: Option<&Path>) -> Result<Option<Roster>> {
