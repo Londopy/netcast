@@ -48,12 +48,12 @@ of frames each, at 1200 baud with 300 ms TXDELAY:
 
 | Message | netcast | FLAMP-style hole lists | 20 separate sessions |
 |---|---|---|---|
-| 4 kB body (2.6 kB compressed, 11 symbols) | 93 s | 96 s | 767 s |
-| 20 kB body (12 kB compressed, 51 symbols) | 217 s | 345 s | 3243 s |
-| 4 kB body, every station at 40% loss | 167 s | 189 s | 1382 s |
+| 4 kB body (2.6 kB compressed, 11 symbols) | 99 s | 99 s | 767 s |
+| 20 kB body (12 kB compressed, 51 symbols) | 219 s | 350 s | 3229 s |
+| 4 kB body, every station at 40% loss | 179 s | 200 s | 1395 s |
 
 Every method got the message to all 20 stations in every trial. On short messages the status
-slots cost about as much as the data, so netcast and FLAMP come out close. The gap opens as
+slots cost about as much as the data, so netcast and FLAMP come out even. The gap opens as
 messages get longer or the channel gets worse. The baselines are generous: the FLAMP model only
 gives slots to stations that are still missing blocks, and the session model leaves out retry
 timers. Run `netcast sim --help` to try other nets.

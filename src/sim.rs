@@ -182,7 +182,7 @@ fn plan(cfg: &Config, ch: &Channel) -> Plan {
         repeats: 0,
         repeat_gap_ms: 0,
         slot_ms: sender::slot_ms(ch, cfg.guard_ms),
-        lead_ms: 0,
+        lead_ms: sender::kiss_lead_ms(ch, cfg.guard_ms),
         guard_ms: cfg.guard_ms,
     }
 }
@@ -267,7 +267,8 @@ fn flamp(
         if missing.iter().all(|m| m.is_empty()) {
             break;
         }
-        airtime += ch.burst_ms(SMALL_FRAME);
+        // the poll, then the same wait before the first reply slot as netcast's
+        airtime += ch.burst_ms(SMALL_FRAME) + sender::kiss_lead_ms(ch, guard_ms) as u64;
         to_send.clear();
         for (m, loss) in missing.iter().zip(losses).filter(|(m, _)| !m.is_empty()) {
             // two bytes per missing block number, split over full frames

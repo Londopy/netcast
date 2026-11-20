@@ -63,6 +63,14 @@ pub fn slot_ms(ch: &Channel, guard_ms: u64) -> u16 {
     (ch.burst_ms(report) + guard_ms).min(u16::MAX as u64) as u16
 }
 
+/// How long KISS stations wait after a status request before slot 0. The
+/// sender's TNC is still sending its closing flags, and its radio still
+/// switching back to receive, when a station decodes the request; an answer
+/// right away runs into that.
+pub fn kiss_lead_ms(ch: &Channel, guard_ms: u64) -> u16 {
+    (ch.txdelay_ms() + guard_ms).min(u16::MAX as u64) as u16
+}
+
 /// Who a delivery is from and for, and how receivers treat it.
 pub struct Envelope {
     pub from: String,

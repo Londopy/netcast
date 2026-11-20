@@ -200,19 +200,18 @@ A station answers each round once, however many copies of the request it hears, 
 lead times and slot lengths over 10 seconds.
 
 The lead time leaves room for anything the sender's TNC may still send after the request, and
-for the sender's radio to get back on receive. Over AX.25 it is TXDELAY plus the guard: without
-it, the first station's answer ran into the end of the sender's own transmission. Over ARDOP it
-is 2300 ms: when the request is the first frame of a transmission,
-ardopcf follows it with a 1.8-second ID frame, and a station that answered straight away would
-talk over it.
+for the sender's radio to get back on receive. Over AX.25 it is TXDELAY plus the guard, since a
+station decodes the request while the sender's TNC is still sending its closing flags. Over
+ARDOP it is 2300 ms: when the request is the first frame of a transmission, ardopcf follows it
+with a 1.8-second ID frame, and the first slot starts after that.
 
 The sender sets the slot length to the report's airtime plus a guard (500 ms by default). Over
 AX.25 the airtime is TXDELAY plus the frame. Over ARDOP it is 4000 ms, measured on ardopcf
 1.0.4.1.3: one 4FSK.500.100S frame, the gap, and the ID frame after it. Once its own
 transmission ends (over ARDOP, when ardopcf reports it has finished), the sender waits out the
 lead time, every slot, and one more guard. If every station has answered sooner, it still waits
-one lead time before sending again, so it doesn't start on top of the last station's ID frame. When a reply arrives
-after the end of its slot, the sender assumes the rest are running just as late, and waits that
+one lead time before sending again, so it doesn't start on top of the last station's ID frame.
+When a reply arrives after the end of its slot, the sender assumes the rest are running just as late, and waits that
 much longer, up to the length of the whole slot window.
 
 ## Type 4: report
