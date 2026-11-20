@@ -8,6 +8,8 @@ what appears on its GitHub release page. Validated in CI by
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-19
+
 ### Added
 
 - `netcast send`: delivers a B2F message or a plain text body to a list of stations over
@@ -29,5 +31,16 @@ what appears on its GitHub release page. Validated in CI by
   report, and receivers answer in 4FSK.500.100S.
 - Optional Ed25519 signatures: `netcast key`, `send --sign`, and `listen --require-signed`.
   Receivers check signatures against the roster and label each message.
+- `netcast upgrade`: installs the newest release after checking it against the release's
+  `SHA256SUMS.txt`, and a once-a-day notice when there is one (`NETCAST_NO_UPDATE_CHECK=1` turns
+  it off).
+- Windows installer, MSIs, portable builds and script installs (the installer, the MSIs and
+  `install.ps1` put netcast on PATH), plus Linux binaries for x64 and arm64.
+- Portable mode: an empty file named `portable` next to the exe keeps the key and logs there.
+- `netcast check`: before a net, checks the state folder, station key, roster, Pat's mailbox
+  and the TNC, one line each.
+- The web page shows recent sent and received deliveries, and takes the gap between bulletin
+  repeats.
 
-[Unreleased]: https://github.com/Londopy/netcast/commits/main
+[Unreleased]: https://github.com/Londopy/netcast/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Londopy/netcast/releases/tag/v0.1.0
