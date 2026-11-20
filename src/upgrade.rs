@@ -1,9 +1,9 @@
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use semver::Version;
@@ -18,6 +18,7 @@ const UA: &str = concat!("netcast/", env!("CARGO_PKG_VERSION"));
 const TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_DOWNLOAD: u64 = 64 << 20;
 const DAY_S: u64 = 86400;
+const SMOKE_TIMEOUT: Duration = Duration::from_secs(15);
 const CACHE: &str = "update-check";
 
 #[derive(Deserialize)]
@@ -144,13 +145,19 @@ fn install(exe: &Path, data: &[u8], version: &Version) -> Result<()> {
     ));
     // a leftover from an earlier attempt that didn't finish
     let _ = fs::remove_file(&staged);
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o755);
-    let mut f = opts.open(&staged).map_err(|e| not_writable(dir, e))?;
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)
+        .map_err(|e| not_writable(dir, e))?;
     let written = f.write_all(data).and_then(|_| f.sync_all());
     drop(f);
+    // the same permissions as the binary it replaces, so a system-wide install
+    // stays usable by everyone
+    #[cfg(unix)]
+    let written = written
+        .and_then(|_| fs::metadata(exe))
+        .and_then(|m| fs::set_permissions(&staged, m.permissions()));
     if let Err(e) = written
         .map_err(anyhow::Error::from)
         .and_then(|_| smoke_test(&staged, version))
@@ -166,12 +173,32 @@ fn install(exe: &Path, data: &[u8], version: &Version) -> Result<()> {
 /// Runs the new binary once, so a build that can't start here (a missing
 /// library, the wrong glibc) never replaces one that works.
 fn smoke_test(staged: &Path, version: &Version) -> Result<()> {
-    let out = Command::new(staged)
+    let mut child = Command::new(staged)
         .arg("--version")
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .with_context(|| format!("starting the downloaded netcast {version}"))?;
-    let said = String::from_utf8_lossy(&out.stdout);
-    if !out.status.success() || !said.contains(&version.to_string()) {
+    let deadline = Instant::now() + SMOKE_TIMEOUT;
+    let status = loop {
+        if let Some(s) = child.try_wait()? {
+            break s;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "the downloaded netcast {version} didn't answer `--version` within {} s, so nothing was changed",
+                SMOKE_TIMEOUT.as_secs()
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+    let mut said = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        out.read_to_string(&mut said)?;
+    }
+    if !status.success() || !said.contains(&version.to_string()) {
         bail!(
             "the downloaded netcast {version} didn't run here (it said {:?}), so nothing was changed",
             said.trim()
@@ -184,7 +211,12 @@ fn smoke_test(staged: &Path, version: &Version) -> Result<()> {
 #[cfg(windows)]
 fn swap(exe: &Path, staged: &Path) -> Result<()> {
     let old = old_exe(exe);
-    let _ = fs::remove_file(&old);
+    if fs::remove_file(&old).is_err() && old.exists() {
+        bail!(
+            "an earlier netcast is still running from {} (a listener or the web page?); stop it and try again",
+            old.display()
+        );
+    }
     fs::rename(exe, &old).with_context(|| format!("moving {} aside", exe.display()))?;
     if let Err(e) = fs::rename(staged, exe) {
         let _ = fs::rename(&old, exe);
@@ -235,6 +267,24 @@ impl Cache {
         }
     }
 
+    /// What's due now: a newer version to tell about (at most once a day), and
+    /// whether to ask GitHub (also at most once a day). Stamps both, so an
+    /// offline station doesn't ask on every command either.
+    fn due(&mut self, now: u64, current: &Version) -> (Option<Version>, bool) {
+        let tell = self
+            .latest
+            .clone()
+            .filter(|v| v > current && a_day_since(self.told, now));
+        if tell.is_some() {
+            self.told = now;
+        }
+        let check = a_day_since(self.checked, now);
+        if check {
+            self.checked = now;
+        }
+        (tell, check)
+    }
+
     fn line(&self) -> String {
         let v = self
             .latest
@@ -259,20 +309,12 @@ pub fn notice(dir: &Path, now: u64) {
     }
     let path = dir.join(CACHE);
     let mut cache = Cache::parse(&fs::read_to_string(&path).unwrap_or_default());
-    let newer = cache.latest.as_ref().filter(|v| **v > current()).cloned();
-    if let Some(v) = &newer
-        && a_day_since(cache.told, now)
-    {
+    let (tell, check) = cache.due(now, &current());
+    if let Some(v) = tell {
         eprintln!(
             "netcast {v} is available (you have {}); run `netcast upgrade` to install it",
             current()
         );
-        cache.told = now;
-    }
-    let check = a_day_since(cache.checked, now);
-    if check {
-        // stamped before asking, so an offline station doesn't ask on every command
-        cache.checked = now;
     }
     if fs::create_dir_all(dir).is_err() || fs::write(&path, cache.line()).is_err() {
         return;
@@ -368,5 +410,39 @@ mod tests {
         let offline = Cache::parse("1700000000 - 0");
         assert_eq!(offline.latest, None);
         assert_eq!(Cache::parse("garbage").checked, 0);
+    }
+
+    #[test]
+    fn tells_and_asks_at_most_once_a_day() {
+        let mine = Version::new(0, 1, 0);
+        let mut c = Cache::parse("");
+        // first run: nothing known yet, so ask, and say nothing
+        assert_eq!(c.due(DAY_S * 10, &mine), (None, true));
+        assert_eq!(c.due(DAY_S * 10 + 60, &mine), (None, false));
+        // the answer came back with a newer version: tell once, not again that day
+        c.latest = Some(Version::new(0, 2, 0));
+        assert_eq!(
+            c.due(DAY_S * 10 + 120, &mine),
+            (Some(Version::new(0, 2, 0)), false)
+        );
+        assert_eq!(c.due(DAY_S * 10 + 180, &mine), (None, false));
+        // a day later both are due again
+        assert_eq!(
+            c.due(DAY_S * 11 + 200, &mine),
+            (Some(Version::new(0, 2, 0)), true)
+        );
+        // nothing to tell once this version is installed
+        let mut c = Cache::parse(&c.line());
+        assert_eq!(c.due(DAY_S * 13, &Version::new(0, 2, 0)), (None, true));
+    }
+
+    #[test]
+    fn a_failed_swap_keeps_the_old_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("netcast.exe");
+        fs::write(&exe, b"old").unwrap();
+        let missing = tmp.path().join(".netcast-9.9.9.exe");
+        assert!(swap(&exe, &missing).is_err());
+        assert_eq!(fs::read(&exe).unwrap(), b"old");
     }
 }
