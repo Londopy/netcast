@@ -189,6 +189,38 @@ Each station's Direwolf waits for a clear channel before it answers, which can p
 past its slot. The sender allows for replies that run late, but on a busy channel a station can
 still be marked silent for a round. If that keeps happening, raise `--guard`.
 
+Direwolf's FX.25 or IL2P (`FX25TX` or `IL2PTX` in `direwolf.conf`) adds forward error correction
+to each frame and can rescue frames that would otherwise be lost. Turn it on only if every
+station on the net does; netcast itself doesn't need to know.
+
+Tested with Direwolf 1.8.1, three stations over a virtual audio cable: an 8 KB message
+(34 symbols) reached two stations and both confirmed in the first status round, in 78 seconds
+at 1200 baud and 11 seconds at 9600. A message written by Pat 1.0.1, attachment included,
+arrived byte for byte, showed up unread in Pat's inbox with its attachment, and Pat replied to
+it normally.
+
+### Running a listener as a service on Linux
+
+On a Raspberry Pi or other always-on station, systemd can keep the listener running. Save this
+as `~/.config/systemd/user/netcast.service`, with your own callsign and paths:
+
+```ini
+[Unit]
+Description=netcast listener
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/netcast listen --call K1ABC --roster %h/net1.londopy
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+```
+
+Then `systemctl --user enable --now netcast`, and `loginctl enable-linger $USER` so it keeps
+running when you're logged out. `journalctl --user -u netcast` shows what it heard.
+
 ## Over HF with ardopcf
 
 netcast can use [ardopcf](https://github.com/pflarue/ardop) in FEC mode instead of Direwolf.
