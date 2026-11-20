@@ -134,11 +134,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RosterCmd,
     },
-    /// Install the newest netcast release, after checking it against the release's checksums.
+    /// Install the newest netcast release, after checking it against the release's
+    /// checksums. Asks first.
     Upgrade {
         /// Only say whether there's a newer release.
         #[arg(long)]
         check: bool,
+        /// Install without asking, for scripts.
+        #[arg(long, conflicts_with = "check")]
+        yes: bool,
     },
     /// Show past deliveries, sent and received.
     Status {
@@ -325,8 +329,8 @@ fn run(cli: Cli) -> Result<bool> {
         upgrade::notice(&history::default_dir(), unix_now());
     }
     match cli.cmd {
-        Cmd::Upgrade { check } => {
-            upgrade::run(check)?;
+        Cmd::Upgrade { check, yes } => {
+            upgrade::run(check, yes)?;
             Ok(true)
         }
         Cmd::Listen { inbox, radio } => {

@@ -119,13 +119,19 @@ then **Run anyway**). Every release ships `SHA256SUMS.txt`; check a download wit
 (Get-FileHash .\<file> -Algorithm SHA256).Hash
 ```
 
-`netcast upgrade` installs a newer release once one is out, after checking it against that
-release's `SHA256SUMS.txt`, and `netcast upgrade --check` only says whether there is one. The
+`netcast upgrade` checks for a newer release and asks before installing it, after checking it
+against that release's `SHA256SUMS.txt`. `--yes` installs without asking, for scripts, and
+`netcast upgrade --check` only says whether there is one. The
 everyday commands also print a one-line notice when a newer release exists, checking GitHub at
 most once a day; set `NETCAST_NO_UPDATE_CHECK=1` to turn that off. The new version is test-run
 before it replaces the old one, so a download that won't start here changes nothing. An
 all-users install in Program Files can't replace itself: run the new installer instead. A
 listener or web page that's already running keeps the old version until you restart it.
+
+Every station on a net needs a release that speaks the same protocol version. 0.2.0 speaks
+version 2 and 0.1.0 spoke version 1, so a net has to upgrade together. A 0.1.0 station hears
+nothing from 0.2.0 ones and says nothing about it, and a 0.2.0 sender lists it as silent; a
+0.2.0 station that hears 0.1.0 frames says so in its log.
 
 netcast keeps its station key and logs in `%LOCALAPPDATA%\netcast` on Windows and
 `~/.local/state/netcast` on Linux. An empty file named `portable` next to the exe keeps them in

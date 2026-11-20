@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -97,8 +97,33 @@ fn verify(data: &[u8], sums: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// `netcast upgrade`: tells what's available, and unless `check_only`, installs it.
-pub fn run(check_only: bool) -> Result<()> {
+/// True for an answer that means go ahead. Anything else, an empty line
+/// included, leaves the old version in place.
+fn agreed(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// Asks before installing, unless `yes` already said so. With nobody at the
+/// keyboard to ask, it doesn't install.
+fn confirm(latest: &Version, yes: bool) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    if !io::stdin().is_terminal() {
+        bail!(
+            "not installing without asking; run `netcast upgrade --yes` to install from a script"
+        );
+    }
+    print!("Install netcast {latest} now? [y/N] ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().lock().read_line(&mut answer)?;
+    Ok(agreed(&answer))
+}
+
+/// `netcast upgrade`: tells what's available, and unless `check_only`, installs
+/// it once the user says yes (or `yes` says so for them).
+pub fn run(check_only: bool, yes: bool) -> Result<()> {
     let agent = agent();
     let latest = latest(&agent)?;
     let cur = current();
@@ -107,7 +132,15 @@ pub fn run(check_only: bool) -> Result<()> {
         return Ok(());
     }
     println!("netcast {latest} is available (you have {cur})");
+    println!("what's new: https://github.com/Londopy/netcast/releases/tag/v{latest}");
     if check_only {
+        return Ok(());
+    }
+    let exe = std::env::current_exe().context("finding the running netcast")?;
+    // before asking, so a yes isn't followed by a download that can't be installed
+    can_write_next_to(&exe)?;
+    if !confirm(&latest, yes)? {
+        println!("not installed; netcast {cur} is unchanged");
         return Ok(());
     }
     let name = asset_name(&latest, std::env::consts::OS, std::env::consts::ARCH).ok_or_else(|| {
@@ -117,9 +150,18 @@ pub fn run(check_only: bool) -> Result<()> {
     let sums = fetch(&agent, &format!("{base}/SHA256SUMS.txt"))?;
     let data = fetch(&agent, &format!("{base}/{name}"))?;
     verify(&data, &String::from_utf8_lossy(&sums), &name)?;
-    let exe = std::env::current_exe().context("finding the running netcast")?;
     install(&exe, &data, &latest)?;
     println!("updated to netcast {latest}");
+    Ok(())
+}
+
+fn can_write_next_to(exe: &Path) -> Result<()> {
+    let dir = exe
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no folder", exe.display()))?;
+    let probe = dir.join(".netcast-upgrade-check");
+    fs::write(&probe, b"").map_err(|e| not_writable(dir, e))?;
+    let _ = fs::remove_file(&probe);
     Ok(())
 }
 
@@ -444,5 +486,15 @@ mod tests {
         let missing = tmp.path().join(".netcast-9.9.9.exe");
         assert!(swap(&exe, &missing).is_err());
         assert_eq!(fs::read(&exe).unwrap(), b"old");
+    }
+
+    #[test]
+    fn only_a_yes_installs() {
+        for a in ["y\n", "Y", "yes\r\n", " YES "] {
+            assert!(agreed(a), "{a:?}");
+        }
+        for a in ["", "\n", "n", "no", "yess", "sure"] {
+            assert!(!agreed(a), "{a:?}");
+        }
     }
 }

@@ -244,8 +244,8 @@ def main():
             continue
         label, note = kind_of(f)
         out.append(f"| [`{f}`]({download}/{f}) | {label} | {human(size)} | {note} |")
-    out += ["", f"Already have {APP}? `netcast upgrade` installs this version, after checking its SHA-256 "
-            "against `SHA256SUMS.txt`.", ""]
+    out += ["", f"Already have {APP}? `netcast upgrade` installs this version after checking its SHA-256 "
+            "against `SHA256SUMS.txt` (from 0.2.0 on, it asks first).", ""]
 
     out += ["## Install", ""]
     if setup:
