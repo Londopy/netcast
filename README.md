@@ -210,7 +210,8 @@ Tested with Direwolf 1.8.1, three stations over a virtual audio cable: an 8 KB m
 (34 symbols) reached two stations and both confirmed in the first status round, in 78 seconds
 at 1200 baud and 11 seconds at 9600. A message written by Pat 1.0.1, attachment included,
 arrived byte for byte, showed up unread in Pat's inbox with its attachment, and Pat replied to
-it normally.
+it normally. Pat's web UI (`pat http`) listed a netcast delivery in the inbox, opened it,
+and queued a reply to the sender in its outbox.
 
 ### Running a listener as a service on Linux
 
@@ -373,16 +374,21 @@ cargo test
 
 - `ofm`'s connectionless port, which waits on `ofm` itself
 - A test with real radios, Direwolf or ardopcf on the air
+- Slotted reports on a big net over the air. The simulator runs nets of up to 60 stations, but
+  the over-the-cable tests had three
 - Opening `.londopy` rosters by double-clicking them in Explorer
 - winget and Scoop packages
 - Winlink Express inboxes, since Express keeps its own message store
 
 ## Patents
 
-RaptorQ is covered by Qualcomm's IETF IPR declaration #1958, which includes a non-assert for
-implementations that fully implement RFC 6330. Netcast uses the `raptorq` crate unmodified, and
-the codec ID in each announcement leaves room for a different fountain code later. This is not
-legal advice.
+RaptorQ is covered by Qualcomm's IETF IPR declarations #1958 and #2554. For devices that don't
+implement a cellular standard they include a non-assert, on the condition that the device fully
+implements RFC 6330, and with a defensive-suspension clause. Netcast uses the `raptorq` crate
+unmodified, and the codec ID in each announcement leaves room for a different fountain code
+later. [docs/patents.md](docs/patents.md) has the details, including one open question about
+the "fully implements" condition. Nobody with legal training has reviewed this yet, and none
+of it is legal advice.
 
 ## Layout
 
@@ -413,6 +419,7 @@ scripts/        release_notes.py: release page, checksums, torrents
 assets/         the icon
 docs/
   protocol.md   the on-air format
+  patents.md    what Qualcomm's RaptorQ declarations say, and what is still open
 ```
 
 ## Contributing
