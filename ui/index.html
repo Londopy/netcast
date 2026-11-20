@@ -43,6 +43,10 @@
           <label class="field" for="repeat">Extra passes</label>
           <input id="repeat" type="number" min="0" max="10" value="0" inputmode="numeric">
         </div>
+        <div id="interval-wrap" hidden>
+          <label class="field" for="interval">Minutes apart</label>
+          <input id="interval" type="number" min="1" max="1440" value="10" inputmode="numeric">
+        </div>
       </div>
       <label class="check" id="ack-wrap" hidden><input type="checkbox" id="ack"> Ask stations to confirm</label>
 
@@ -82,6 +86,20 @@
     <h2 id="in-h">Incoming</h2>
     <ul class="msgs" id="incoming"></ul>
     <p class="empty" id="incoming-empty">Nothing received yet.</p>
+  </section>
+
+  <section class="history" aria-labelledby="history-h">
+    <h2 id="history-h">History</h2>
+    <div class="history-cols">
+      <div>
+        <h3>Sent</h3>
+        <ul class="msgs" id="sent"></ul>
+      </div>
+      <div>
+        <h3>Received</h3>
+        <ul class="msgs" id="received"></ul>
+      </div>
+    </div>
   </section>
 
   <section class="log" aria-labelledby="log-h">

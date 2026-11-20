@@ -42,6 +42,8 @@ body {
 
 h1, h2 { margin: 0; font-weight: 700; }
 h1 { font-size: 1.15rem; letter-spacing: 0.02em; }
+h3 { margin: 0 0 0.4rem; font-size: 0.9rem; }
+.history-cols { display: grid; gap: 0.5rem 2rem; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); }
 h2 {
   font-size: 0.78rem;
   text-transform: uppercase;
@@ -78,18 +80,19 @@ h2 {
   gap: 1px;
   background: var(--rule);
   grid-template-columns: minmax(0, 1fr);
-  grid-template-areas: "send" "air" "incoming" "log";
+  grid-template-areas: "send" "air" "incoming" "history" "log";
 }
 .grid > section { background: var(--bg); padding: 1.1rem 1.25rem 1.4rem; min-width: 0; }
 .send { grid-area: send; }
 .air { grid-area: air; }
 .incoming { grid-area: incoming; }
+.history { grid-area: history; }
 .log { grid-area: log; }
 
 @media (min-width: 900px) {
   .grid {
     grid-template-columns: minmax(0, 5fr) minmax(0, 6fr);
-    grid-template-areas: "send air" "send incoming" "log log";
+    grid-template-areas: "send air" "send incoming" "history history" "log log";
   }
   .send { background: var(--panel); }
 }

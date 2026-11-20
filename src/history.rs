@@ -2,6 +2,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
+
 use crate::message;
 use crate::receiver::Ack;
 
@@ -127,30 +129,55 @@ pub fn decoded_since(dir: &Path, since_unix: u64) -> io::Result<Vec<u32>> {
         .collect())
 }
 
+/// One line of history: a delivery this station sent or received.
+#[derive(Debug, PartialEq, Serialize)]
+pub struct Entry {
+    pub unix: u64,
+    pub id: String,
+    pub mid: String,
+    pub mode: String,
+    /// For a sent delivery, each recipient and its state; for a received one,
+    /// the local callsigns it went to.
+    pub who: String,
+}
+
+/// Sent and received deliveries, each list oldest first.
+pub fn entries(dir: &Path) -> io::Result<(Vec<Entry>, Vec<Entry>)> {
+    let read = |file: &str, who_field: usize| -> io::Result<Vec<Entry>> {
+        Ok(lines(dir, file)?
+            .iter()
+            .filter_map(|l| {
+                let f: Vec<&str> = l.split('\t').collect();
+                Some(Entry {
+                    unix: f.first()?.parse().ok()?,
+                    id: f.get(1)?.to_string(),
+                    mid: f.get(2)?.to_string(),
+                    mode: f.get(3)?.to_string(),
+                    who: f.get(who_field)?.replace('=', " ").replace(',', ", "),
+                })
+            })
+            .collect())
+    };
+    Ok((read(SENT, 4)?, read(RECEIVED, 6)?))
+}
+
 /// Both logs as readable text, oldest first.
 pub fn report(dir: &Path) -> io::Result<String> {
+    let (sent, received) = entries(dir)?;
     let mut out = String::new();
-    for (title, file, people) in [("sent", SENT, 4), ("received", RECEIVED, 6)] {
-        let rows = lines(dir, file)?;
+    for (title, rows) in [("sent", sent), ("received", received)] {
         out += &format!("{title}\n");
         if rows.is_empty() {
             out += "  nothing yet\n";
         }
-        for l in rows {
-            let f: Vec<&str> = l.split('\t').collect();
-            let (Some(unix), Some(id), Some(mid), Some(mode), Some(who)) = (
-                f.first().and_then(|u| u.parse().ok()),
-                f.get(1),
-                f.get(2),
-                f.get(3),
-                f.get(people),
-            ) else {
-                continue;
-            };
-            let who = who.replace('=', " ").replace(',', ", ");
+        for e in rows {
             out += &format!(
-                "  {}  {id}  {mid:<12}  {mode:<9}  {who}\n",
-                message::date(unix)
+                "  {}  {}  {:<12}  {:<9}  {}\n",
+                message::date(e.unix),
+                e.id,
+                e.mid,
+                e.mode,
+                e.who
             );
         }
     }

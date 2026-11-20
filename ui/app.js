@@ -140,6 +140,23 @@ function showLog(lines) {
   }
 }
 
+function showHistory(h) {
+  const rows = (list) => (list && list.length)
+    ? list.map((e) => el("li", {},
+        el("div", { class: "msg-top" },
+          el("span", { class: "from" }, e.mid),
+          el("span", { class: "meta" }, `${e.mode}, ${e.when}`)),
+        el("p", { class: "subject" }, e.who)))
+    : [el("li", {}, el("span", { class: "empty" }, "Nothing yet."))];
+  if (h.error) {
+    $("sent").replaceChildren(el("li", {}, el("span", { class: "note" }, `Can't read the history: ${h.error}`)));
+    $("received").replaceChildren();
+    return;
+  }
+  $("sent").replaceChildren(...rows(h.sent));
+  $("received").replaceChildren(...rows(h.received));
+}
+
 function render(s) {
   $("lost").hidden = true;
   $("who").textContent = `${s.call} on ${s.net}`;
@@ -151,6 +168,7 @@ function render(s) {
   showSigning(s.can_sign);
   showAir(s.board.sending);
   showIncoming(s.board.incoming, s.net);
+  showHistory(s.history);
   showLog(s.board.log);
   const busy = s.board.sending && s.board.sending.phase === "sending";
   $("go").disabled = busy;
@@ -174,6 +192,7 @@ function syncMode() {
   $("ack-wrap").hidden = mode !== "emergency";
   if (mode !== "emergency") $("ack").checked = false;
   $("repeat-wrap").hidden = mode === "addressed" || $("ack").checked;
+  $("interval-wrap").hidden = $("repeat-wrap").hidden || !(Number($("repeat").value) > 0);
 }
 
 function syncSource() {
@@ -192,6 +211,7 @@ async function send(ev) {
     mode: $("mode").value,
     ack: $("ack").checked,
     repeat: Number($("repeat").value) || 0,
+    interval_min: Number($("interval").value) || 10,
     sign: $("sign").checked,
   };
   if (outbox) {
@@ -227,6 +247,7 @@ async function send(ev) {
 $("form").addEventListener("submit", send);
 $("mode").addEventListener("change", syncMode);
 $("ack").addEventListener("change", syncMode);
+$("repeat").addEventListener("input", syncMode);
 for (const r of document.querySelectorAll('input[name="source"]')) r.addEventListener("change", syncSource);
 syncMode();
 poll();

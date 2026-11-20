@@ -1,9 +1,10 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::SystemTime;
 
 use anyhow::{Result, anyhow};
 use rand::RngExt;
@@ -13,14 +14,15 @@ use serde_json::json;
 use crate::codec::MAX_OBJECT;
 use crate::frame::Mode;
 use crate::keys;
-use crate::message;
 use crate::receiver::Trust;
 use crate::roster::Roster;
 use crate::sender::{Progress, State};
 use crate::station::{self, Inbox, Outgoing, Station, unix_now};
+use crate::{history, message};
 
 const LOG_LINES: usize = 200;
 const INCOMING_MAX: usize = 50;
+const HISTORY_ROWS: usize = 10;
 const LOG_WIDTH: usize = 300;
 const SUBJECT_WIDTH: usize = 120;
 // a message is at most 4 MiB, and a form around it is small
@@ -178,6 +180,13 @@ pub struct SendForm {
     pub ack: bool,
     #[serde(default)]
     pub repeat: u32,
+    /// Minutes between bulletin repeats.
+    #[serde(default = "default_interval")]
+    pub interval_min: u64,
+}
+
+fn default_interval() -> u64 {
+    10
 }
 
 /// One HTTP request, as far as the UI cares.
@@ -216,7 +225,7 @@ pub struct Ui {
     station: Arc<Station>,
     board: Shared,
     roster: Option<Roster>,
-    outbox: Option<PathBuf>,
+    outbox: Option<Outbox>,
     token: String,
     port: u16,
 }
@@ -228,7 +237,7 @@ impl Ui {
             station: Arc::new(station),
             board: Arc::new(Mutex::new(Board::default())),
             roster,
-            outbox,
+            outbox: outbox.map(Outbox::new),
             token: keys::hex(&token),
             port,
         }
@@ -335,12 +344,28 @@ impl Ui {
             })
         });
         let board = edit(&self.board, |b| serde_json::to_value(&*b)).expect("board serializes");
+        let recent = |rows: Vec<history::Entry>| -> Vec<serde_json::Value> {
+            rows.iter()
+                .rev()
+                .take(HISTORY_ROWS)
+                .map(|e| {
+                    json!({
+                        "when": format!("{} UTC", message::date(e.unix)),
+                        "id": e.id, "mid": e.mid, "mode": e.mode, "who": clean(&e.who, LOG_WIDTH),
+                    })
+                })
+                .collect()
+        };
+        let history = history::entries(&self.station.dir)
+            .map(|(sent, received)| json!({ "sent": recent(sent), "received": recent(received) }))
+            .unwrap_or_else(|e| json!({ "error": e.to_string() }));
         json!({
             "call": self.station.call.to_string(),
             "net": self.station.net.to_string(),
             "can_sign": self.station.key.is_some(),
             "roster": roster,
-            "outbox": self.outbox.as_deref().map(outbox_files),
+            "outbox": self.outbox.as_ref().map(Outbox::list),
+            "history": history,
             "board": board,
         })
     }
@@ -407,22 +432,24 @@ impl Ui {
         let mut out = Outgoing::new(b2f, to, mode, f.ack)?;
         out.sign = f.sign;
         out.repeats = f.repeat.min(10);
+        out.interval_s = f.interval_min.clamp(1, 24 * 60) * 60;
         Ok(out)
     }
 
     fn outbox_message(&self, name: &str) -> Result<Vec<u8>> {
-        let dir = self
+        let outbox = self
             .outbox
-            .as_deref()
+            .as_ref()
             .ok_or_else(|| anyhow!("this station has no outbox folder"))?;
         // only plain names of files that are listed, never a path
-        if !outbox_files(dir)
+        if !outbox
+            .list()
             .iter()
             .any(|f| f.file == name && f.problem.is_none())
         {
             return Err(anyhow!("{name} is not a usable message in the outbox"));
         }
-        Ok(fs::read(dir.join(name))?)
+        Ok(fs::read(outbox.dir.join(name))?)
     }
 }
 
@@ -489,7 +516,7 @@ fn run_send(s: &Station, b: &Shared, out: Outgoing) {
     });
 }
 
-#[derive(Serialize, PartialEq, Debug)]
+#[derive(Clone, Serialize, PartialEq, Debug)]
 pub struct OutboxFile {
     pub file: String,
     pub mid: Option<String>,
@@ -497,46 +524,89 @@ pub struct OutboxFile {
     pub problem: Option<String>,
 }
 
-/// The .b2f files in the outbox folder, with what's wrong with any that can't go.
-pub fn outbox_files(dir: &Path) -> Vec<OutboxFile> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return vec![];
-    };
-    let mut files: Vec<OutboxFile> = entries
-        .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| n.to_ascii_lowercase().ends_with(".b2f"))
-        .map(|file| {
-            let read = fs::metadata(dir.join(&file))
-                .map_err(|e| e.to_string())
-                .and_then(|m| {
-                    if m.len() as usize > MAX_OBJECT {
-                        Err("over 4 MiB".into())
-                    } else {
-                        fs::read(dir.join(&file)).map_err(|e| e.to_string())
-                    }
-                });
-            match read.and_then(|b| message::check(&b).map(|mid| (mid, b))) {
-                Ok((mid, b)) => OutboxFile {
-                    file,
-                    mid: Some(mid),
-                    subject: message::header(&b, "subject"),
-                    problem: None,
-                },
-                Err(why) => OutboxFile {
-                    file,
-                    mid: None,
-                    subject: None,
-                    problem: Some(why),
-                },
-            }
-        })
-        .collect();
-    files.sort_by(|a, b| a.file.cmp(&b.file));
-    files
+/// A file as it was when last checked: its size and time, and the result.
+struct Checked {
+    len: u64,
+    time: Option<SystemTime>,
+    file: OutboxFile,
 }
 
+/// The outbox folder. Each file is read and checked once, and again only when
+/// its size or time changes, since the page asks for the list every second.
+pub struct Outbox {
+    dir: PathBuf,
+    checked: Mutex<HashMap<String, Checked>>,
+}
+
+impl Outbox {
+    pub fn new(dir: PathBuf) -> Outbox {
+        Outbox {
+            dir,
+            checked: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The .b2f files in the folder, with what's wrong with any that can't go.
+    pub fn list(&self) -> Vec<OutboxFile> {
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return vec![];
+        };
+        let mut checked = self.checked.lock().unwrap_or_else(|e| e.into_inner());
+        let mut files = vec![];
+        for e in entries.flatten() {
+            let Ok(meta) = e.metadata() else { continue };
+            let Ok(file) = e.file_name().into_string() else {
+                continue;
+            };
+            if !meta.is_file() || !file.to_ascii_lowercase().ends_with(".b2f") {
+                continue;
+            }
+            let (len, time) = (meta.len(), meta.modified().ok());
+            let entry = match checked.get(&file) {
+                Some(c) if c.len == len && c.time == time => c.file.clone(),
+                _ => {
+                    let f = check_file(&self.dir, file.clone(), len);
+                    // a file that couldn't be read (locked, still syncing) gets
+                    // another try on the next poll instead of staying broken
+                    if f.problem.is_none() {
+                        let c = Checked {
+                            len,
+                            time,
+                            file: f.clone(),
+                        };
+                        checked.insert(file, c);
+                    }
+                    f
+                }
+            };
+            files.push(entry);
+        }
+        files.sort_by(|a, b| a.file.cmp(&b.file));
+        files
+    }
+}
+
+fn check_file(dir: &Path, file: String, len: u64) -> OutboxFile {
+    let read = if len as usize > MAX_OBJECT {
+        Err("over 4 MiB".to_string())
+    } else {
+        fs::read(dir.join(&file)).map_err(|e| e.to_string())
+    };
+    match read.and_then(|b| message::check(&b).map(|mid| (mid, b))) {
+        Ok((mid, b)) => OutboxFile {
+            file,
+            mid: Some(mid),
+            subject: message::header(&b, "subject"),
+            problem: None,
+        },
+        Err(why) => OutboxFile {
+            file,
+            mid: None,
+            subject: None,
+            problem: Some(why),
+        },
+    }
+}
 fn read_request(r: &mut tiny_http::Request) -> Result<Req> {
     let header = |name: &str| {
         r.headers()
@@ -680,11 +750,17 @@ mod tests {
         fs::write(tmp.path().join("a.b2f"), &good).unwrap();
         fs::write(tmp.path().join("b.b2f"), b"garbage").unwrap();
         fs::write(tmp.path().join("notes.txt"), b"ignored").unwrap();
-        let files = outbox_files(tmp.path());
+        let outbox = Outbox::new(tmp.path().to_path_buf());
+        let files = outbox.list();
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].mid.as_deref(), Some(mid.as_str()));
         assert_eq!(files[0].subject.as_deref(), Some("Sitrep"));
         assert!(files[1].problem.is_some());
+        // a file that changes is checked again
+        fs::write(tmp.path().join("a.b2f"), b"now broken").unwrap();
+        assert!(outbox.list()[0].problem.is_some());
+        fs::write(tmp.path().join("a.b2f"), &good).unwrap();
+        assert!(outbox.list()[0].problem.is_none());
 
         let u = ui(Some(tmp.path().to_path_buf()));
         assert_eq!(u.outbox_message("a.b2f").unwrap(), good);
