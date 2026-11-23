@@ -415,7 +415,9 @@ mod tests {
             .path()
             .join(format!("netcast{}", std::env::consts::EXE_SUFFIX));
         fs::write(&exe, b"the working netcast").unwrap();
-        let err = install(&exe, b"not a program", &Version::new(9, 9, 9)).unwrap_err();
+        // the MZ header makes Windows refuse it quietly; without one it treats the
+        // file as a 16-bit program and opens a dialog that stalls the test run
+        let err = install(&exe, b"MZ not a program", &Version::new(9, 9, 9)).unwrap_err();
         assert!(format!("{err:#}").contains("9.9.9"), "{err:#}");
         assert_eq!(fs::read(&exe).unwrap(), b"the working netcast");
         // nothing staged is left behind
