@@ -265,6 +265,36 @@ mod tests {
     }
 
     #[test]
+    fn a_second_send_gets_a_409_and_the_state_has_no_screen_flags() {
+        let u = ui(None);
+        edit(&u.control.board, |b| {
+            b.quiet = true;
+            b.sending = Some(crate::control::Sending {
+                id: "1".into(),
+                mid: "FIRST".into(),
+                mode: "addressed",
+                precedence: "routine",
+                k: 1,
+                signed: false,
+                recipients: vec![],
+                round: 0,
+                phase: "sending",
+                error: None,
+            })
+        });
+        let post = Req {
+            method: "POST".into(),
+            body: br#"{"to":["K1ABC"],"mode":"addressed","subject":"x","body":"y"}"#.to_vec(),
+            ..get(&u, "/api/send")
+        };
+        assert_eq!(u.handle(&post).status, 409);
+        let state: serde_json::Value =
+            serde_json::from_slice(&u.handle(&get(&u, "/api/state")).body).unwrap();
+        assert!(state["board"].get("quiet").is_none(), "{state}");
+        assert_eq!(state["board"]["sending"]["mid"], "FIRST");
+    }
+
+    #[test]
     fn serves_the_page_with_its_token() {
         let u = ui(None);
         let r = u.handle(&Req {

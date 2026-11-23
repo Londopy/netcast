@@ -346,7 +346,12 @@ port, and runs the listener too.
 | Up, Down | change the number of repeats and the minutes between them |
 | Ctrl+S | send |
 | F1 to F4 | in a terminal under 100 columns, show Send, On the air, Incoming or Log |
-| q, Ctrl+C | quit; q types a letter while a text field has the cursor. Quitting while a delivery is on the air asks first, since it stops the delivery |
+| q, Ctrl+C | quit; q types a letter while a text field has the cursor. Quitting asks first while a delivery is on the air, since it stops the delivery, or while a written message hasn't gone |
+
+Pasting into To, Subject or Message puts the text in as it is, tabs and line breaks included,
+instead of acting on them as keys. The outbox file you pick stays picked when other files come
+and go, and if it disappears before you send, netcast says so instead of sending another. A
+terminal too short for the whole form shows one pane at a time, as a narrow one does.
 
 It uses the terminal's own colours, and none at all when `NO_COLOR` is set.
 

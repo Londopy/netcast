@@ -422,10 +422,10 @@ impl Outbox {
             let entry = match checked.get(&file) {
                 Some(c) if c.len == len && c.time == time => c.file.clone(),
                 _ => {
-                    let f = check_file(&self.dir, file.clone(), len);
+                    let (f, read) = check_file(&self.dir, file.clone(), len);
                     // a file that couldn't be read (locked, still syncing) gets
                     // another try on the next poll instead of staying broken
-                    if f.problem.is_none() {
+                    if read {
                         let c = Checked {
                             len,
                             time,
@@ -443,13 +443,15 @@ impl Outbox {
     }
 }
 
-fn check_file(dir: &Path, file: String, len: u64) -> OutboxFile {
+/// The file's listing, and whether it could be read at all.
+fn check_file(dir: &Path, file: String, len: u64) -> (OutboxFile, bool) {
     let read = if len as usize > MAX_OBJECT {
         Err("over 4 MiB".to_string())
     } else {
         fs::read(dir.join(&file)).map_err(|e| e.to_string())
     };
-    match read.and_then(|b| message::check(&b).map(|mid| (mid, b))) {
+    let was_read = read.is_ok() || len as usize > MAX_OBJECT;
+    let listed = match read.and_then(|b| message::check(&b).map(|mid| (mid, b))) {
         Ok((mid, b)) => OutboxFile {
             file,
             mid: Some(mid),
@@ -462,7 +464,8 @@ fn check_file(dir: &Path, file: String, len: u64) -> OutboxFile {
             subject: None,
             problem: Some(why),
         },
-    }
+    };
+    (listed, was_read)
 }
 
 #[cfg(test)]
@@ -534,6 +537,51 @@ mod tests {
             Precedence::Welfare
         );
         assert!(p(r#","precedence":"flash""#).is_err());
+    }
+
+    #[test]
+    fn history_is_newest_first_and_short() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = Control::new(
+            Station::new(
+                "N0NCS".parse().unwrap(),
+                "NET1".parse().unwrap(),
+                control(None).station.radio.clone(),
+                tmp.path().to_path_buf(),
+                None,
+            ),
+            None,
+            None,
+        );
+        for i in 0..15 {
+            history::record_sent(tmp.path(), i, i as u32, &format!("MID{i}"), "bulletin", &[])
+                .unwrap();
+        }
+        let (sent, received) = c.history().unwrap();
+        assert_eq!(sent.len(), HISTORY_ROWS);
+        assert_eq!(sent[0].mid, "MID14");
+        assert_eq!(sent[HISTORY_ROWS - 1].mid, "MID5");
+        assert!(received.is_empty());
+    }
+
+    #[test]
+    fn a_file_that_isnt_a_message_is_checked_once_until_it_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, good) = message::compose("N0NCS", &["K1ABC".into()], "Sitrep", "all ok", 0);
+        let path = tmp.path().join("a.b2f");
+        fs::write(&path, vec![b'x'; good.len()]).unwrap();
+        let when = fs::metadata(&path).unwrap().modified().unwrap();
+        let outbox = Outbox::new(tmp.path().to_path_buf());
+        assert!(outbox.list()[0].problem.is_some());
+        // same size and time: the earlier verdict stands without reading it again
+        fs::write(&path, &good).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+        assert!(outbox.list()[0].problem.is_some());
     }
 
     #[test]

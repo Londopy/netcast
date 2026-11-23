@@ -403,11 +403,8 @@ fn run(cli: Cli) -> Result<bool> {
             outbox,
             radio,
         } => {
-            let roster = load_roster(inbox.roster.as_deref())?;
-            let call = first_call(&inbox)?;
-            let st = station(call, radio, roster.as_ref())?;
-            let inbox = inbox_for(inbox, &st, roster.as_ref())?;
-            tui::run(control::Control::new(st, roster, outbox), inbox)?;
+            let (control, inbox) = net_control(inbox, outbox, radio)?;
+            tui::run(control, inbox)?;
             Ok(true)
         }
         Cmd::Ui {
@@ -416,11 +413,8 @@ fn run(cli: Cli) -> Result<bool> {
             port,
             radio,
         } => {
-            let roster = load_roster(inbox.roster.as_deref())?;
-            let call = first_call(&inbox)?;
-            let st = station(call, radio, roster.as_ref())?;
-            let inbox = inbox_for(inbox, &st, roster.as_ref())?;
-            ui::Ui::new(control::Control::new(st, roster, outbox), port).run(inbox)?;
+            let (control, inbox) = net_control(inbox, outbox, radio)?;
+            ui::Ui::new(control, port).run(inbox)?;
             Ok(true)
         }
         Cmd::Check {
@@ -589,6 +583,19 @@ fn check(call: &str, roster: Option<&Path>, mailbox: Option<PathBuf>, radio: Rad
         Err(e) => line(Some(false), format!("{e:#}")),
     }
     ok
+}
+
+/// The station, roster and outbox behind a net-control screen, and what its listener takes.
+fn net_control(
+    args: InboxArgs,
+    outbox: Option<PathBuf>,
+    radio: RadioArgs,
+) -> Result<(control::Control, station::Inbox)> {
+    let roster = load_roster(args.roster.as_deref())?;
+    let call = first_call(&args)?;
+    let st = station(call, radio, roster.as_ref())?;
+    let inbox = inbox_for(args, &st, roster.as_ref())?;
+    Ok((control::Control::new(st, roster, outbox), inbox))
 }
 
 fn load_roster(path: Option<&Path>) -> Result<Option<Roster>> {

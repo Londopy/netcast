@@ -8,10 +8,14 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Paragraph, Row, Table, Wrap};
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui_textarea::TextArea;
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
+use ratatui::crossterm::execute;
+use ratatui_textarea::{TextArea, WrapMode};
 
 use crate::control::{Board, Control, OutboxFile, Refused, SendForm, Sending, edit};
 use crate::frame::{Mode, Precedence};
@@ -66,6 +70,22 @@ enum Source {
     Outbox,
 }
 
+// more plain keys than this arriving at once is a paste, not typing
+const PASTE_BURST: usize = 4;
+
+fn text_box() -> TextArea<'static> {
+    let mut t = TextArea::default();
+    t.set_cursor_line_style(Style::new());
+    t.set_selection_style(Style::new().add_modifier(Modifier::REVERSED));
+    t
+}
+
+fn body_box() -> TextArea<'static> {
+    let mut t = text_box();
+    t.set_wrap_mode(WrapMode::Word);
+    t
+}
+
 /// The send form, as the web page has it.
 pub struct Form {
     to: TextArea<'static>,
@@ -77,7 +97,8 @@ pub struct Form {
     source: Source,
     subject: TextArea<'static>,
     body: TextArea<'static>,
-    file: usize,
+    /// The outbox file picked, by name, so files coming and going don't change it.
+    file: Option<String>,
     sign: bool,
     pub field: Field,
     has_outbox: bool,
@@ -97,16 +118,16 @@ fn step<T: Copy + PartialEq>(all: &[T], now: T, forward: bool) -> T {
 impl Form {
     fn new(has_outbox: bool) -> Form {
         Form {
-            to: TextArea::default(),
+            to: text_box(),
             mode: Mode::Addressed,
             precedence: Precedence::Routine,
             ack: false,
             repeat: 0,
             interval_min: 10,
             source: Source::Compose,
-            subject: TextArea::default(),
-            body: TextArea::default(),
-            file: 0,
+            subject: text_box(),
+            body: body_box(),
+            file: None,
             sign: false,
             field: Field::To,
             has_outbox,
@@ -124,7 +145,10 @@ impl Form {
             f.push(Field::Ack);
         }
         if !self.acks() {
-            f.extend([Field::Repeat, Field::Interval]);
+            f.push(Field::Repeat);
+            if self.repeat > 0 {
+                f.push(Field::Interval);
+            }
         }
         if self.has_outbox {
             f.push(Field::Source);
@@ -135,6 +159,20 @@ impl Form {
         }
         f.push(Field::Sign);
         f
+    }
+
+    /// Rows the form needs to show every field, the message at three lines.
+    fn height(&self) -> u16 {
+        let fields = self.fields();
+        let body = if fields.contains(&Field::Body) { 2 } else { 0 };
+        fields.len() as u16 + 1 + 2 + body
+    }
+
+    /// Whether there's a message written that hasn't gone yet.
+    fn has_text(&self) -> bool {
+        [&self.subject, &self.body]
+            .iter()
+            .any(|t| t.lines().iter().any(|l| !l.trim().is_empty()))
     }
 
     fn move_focus(&mut self, forward: bool) {
@@ -149,6 +187,36 @@ impl Form {
         }
     }
 
+    /// The outbox file that would go: the one picked, or the first.
+    fn picked<'a>(&self, usable: &'a [OutboxFile]) -> Result<&'a OutboxFile, String> {
+        match &self.file {
+            Some(name) => usable
+                .iter()
+                .find(|f| &f.file == name)
+                .ok_or_else(|| format!("{name} is no longer in the outbox.")),
+            None => usable
+                .first()
+                .ok_or_else(|| "No messages in the outbox yet.".into()),
+        }
+    }
+
+    fn pick_next(&mut self, usable: &[OutboxFile], forward: bool) {
+        let n = usable.len();
+        if n == 0 {
+            return;
+        }
+        let now = self
+            .picked(usable)
+            .ok()
+            .and_then(|p| usable.iter().position(|f| f.file == p.file));
+        let i = match now {
+            Some(i) if forward => (i + 1) % n,
+            Some(i) => (i + n - 1) % n,
+            None => 0,
+        };
+        self.file = Some(usable[i].file.clone());
+    }
+
     pub fn to_send_form(&self, usable: &[OutboxFile]) -> SendForm {
         let to = self.to.lines().join(" ");
         let (subject, body, file) = match self.source {
@@ -160,7 +228,7 @@ impl Form {
             Source::Outbox => (
                 String::new(),
                 String::new(),
-                usable.get(self.file).map(|f| f.file.clone()),
+                self.picked(usable).ok().map(|f| f.file.clone()),
             ),
         };
         SendForm {
@@ -182,6 +250,42 @@ impl Form {
     }
 }
 
+/// What a key press means here. Windows reports AltGr as Ctrl+Alt, and
+/// Ctrl+letter in upper case while Caps Lock is on.
+fn normalise(mut k: KeyEvent) -> KeyEvent {
+    let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+    if let KeyCode::Char(c) = k.code {
+        if k.modifiers.contains(altgr) {
+            k.modifiers.remove(altgr);
+        } else if k.modifiers.contains(KeyModifiers::CONTROL) {
+            k.code = KeyCode::Char(c.to_ascii_lowercase());
+        }
+    }
+    k
+}
+
+/// A burst of plain keys that arrived together is a paste, the way Windows
+/// consoles deliver one: text, tabs and line breaks, more at once than anyone types.
+fn as_paste(keys: &[KeyEvent]) -> Option<String> {
+    if keys.len() < PASTE_BURST {
+        return None;
+    }
+    keys.iter()
+        .map(|k| match k.code {
+            KeyCode::Char(c)
+                if !k
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                Some(c)
+            }
+            KeyCode::Tab => Some('\t'),
+            KeyCode::Enter => Some('\n'),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The terminal screen's own state; everything the station reports comes from
 /// the board on each draw.
 pub struct App {
@@ -189,9 +293,13 @@ pub struct App {
     pub form: Form,
     pub pane: Pane,
     status: String,
-    confirm_quit: bool,
+    confirm_quit: Option<&'static str>,
     colour: bool,
     wide: bool,
+    form_fits: bool,
+    /// The outbox as of the last draw, listed before the board is locked.
+    files: Vec<OutboxFile>,
+    last_press: Option<char>,
 }
 
 impl App {
@@ -202,9 +310,12 @@ impl App {
             form: Form::new(has_outbox),
             pane: Pane::Send,
             status: String::new(),
-            confirm_quit: false,
+            confirm_quit: None,
             colour,
             wide: true,
+            form_fits: true,
+            files: vec![],
+            last_press: None,
         }
     }
 
@@ -223,22 +334,101 @@ impl App {
         })
     }
 
+    fn editing(&self) -> bool {
+        self.form_fits && (self.wide || self.pane == Pane::Send)
+    }
+
+    /// The key to act on for one key event, if any. Only presses count, except
+    /// that Windows delivers a character typed as an Alt code (how a pseudo
+    /// console sends symbols that aren't on the keyboard) as a release alone.
+    fn effective(&mut self, k: KeyEvent) -> Option<KeyEvent> {
+        match (k.kind, k.code) {
+            (KeyEventKind::Press | KeyEventKind::Repeat, code) => {
+                self.last_press = match code {
+                    KeyCode::Char(c) => Some(c),
+                    _ => None,
+                };
+                Some(normalise(k))
+            }
+            (KeyEventKind::Release, KeyCode::Char(c)) if !c.is_ascii() => {
+                (self.last_press.take() != Some(c)).then(|| KeyEvent::new(k.code, k.modifiers))
+            }
+            _ => None,
+        }
+    }
+
+    /// Handles one terminal event. False means quit.
+    pub fn event(&mut self, ev: Event) -> bool {
+        match ev {
+            Event::Key(k) => self.effective(k).is_none_or(|k| self.key(k)),
+            Event::Paste(s) => {
+                self.paste(&s);
+                true
+            }
+            _ => true,
+        }
+    }
+
+    /// Handles everything that was waiting at once, so a paste that arrives as
+    /// keys goes in as text. False means quit.
+    fn events(&mut self, events: Vec<Event>) -> bool {
+        let mut keys = vec![];
+        let mut other = vec![];
+        for ev in events {
+            match ev {
+                Event::Key(k) => keys.extend(self.effective(k)),
+                ev => other.push(ev),
+            }
+        }
+        if self.editing()
+            && self.form.field.is_text()
+            && let Some(text) = as_paste(&keys)
+        {
+            self.paste(&text);
+            keys.clear();
+        }
+        keys.into_iter().all(|k| self.key(k)) && other.into_iter().all(|ev| self.event(ev))
+    }
+
+    fn paste(&mut self, text: &str) {
+        let text = text.replace("\r\n", "\n").replace('\t', " ");
+        let one_line = text.replace('\n', " ");
+        let editing = self.editing();
+        let form = &mut self.form;
+        match form.field {
+            Field::To if editing => {
+                form.to.insert_str(one_line);
+            }
+            Field::Subject if editing => {
+                form.subject.insert_str(one_line);
+            }
+            Field::Body if editing => {
+                form.body.insert_str(text);
+            }
+            _ => self.status = "To paste, move to To, Subject or Message first.".into(),
+        }
+    }
+
     /// Handles one key press. False means quit.
     pub fn key(&mut self, k: KeyEvent) -> bool {
-        if self.confirm_quit {
-            self.confirm_quit = false;
-            return k.code != KeyCode::Char('y');
+        let k = normalise(k);
+        if self.confirm_quit.take().is_some() {
+            return !matches!(k.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'y'));
         }
+        self.status.clear();
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        let editing = self.wide || self.pane == Pane::Send;
+        let editing = self.editing();
         let quit = (ctrl && k.code == KeyCode::Char('c'))
             || (k.code == KeyCode::Char('q') && !(editing && self.form.field.is_text()));
         if quit {
-            if self.on_the_air() {
-                self.confirm_quit = true;
-                return true;
-            }
-            return false;
+            self.confirm_quit = if self.on_the_air() {
+                Some("A delivery is on the air. Quit anyway? y/n")
+            } else if self.form.has_text() {
+                Some("Quit and lose the message you haven't sent? y/n")
+            } else {
+                None
+            };
+            return self.confirm_quit.is_some();
         }
         match k.code {
             KeyCode::F(n @ 1..=4) => self.pane = PANES[n as usize - 1].0,
@@ -251,14 +441,29 @@ impl App {
 
     fn send(&mut self) {
         let usable = self.usable_files();
+        if self.form.source == Source::Outbox
+            && let Err(why) = self.form.picked(&usable)
+        {
+            self.status = format!("{why} Pick a message from the outbox.");
+            return;
+        }
         let form = self.form.to_send_form(&usable);
+        let to = if form.to.is_empty() {
+            "every member of the roster".to_string()
+        } else {
+            form.to.join(", ")
+        };
         self.status = match self.control.send(form) {
             Ok(()) => {
                 if self.form.source == Source::Compose {
-                    self.form.subject = TextArea::default();
-                    self.form.body = TextArea::default();
+                    self.form.subject = text_box();
+                    self.form.body = body_box();
                 }
-                String::new()
+                if self.wide {
+                    format!("Sending to {to}.")
+                } else {
+                    format!("Sending to {to}. F2 shows each station.")
+                }
             }
             Err(Refused::Busy) => "A delivery is already on the air.".into(),
             Err(Refused::Invalid(why)) => format!("Not sent: {why}."),
@@ -303,13 +508,8 @@ impl App {
                 };
             }
             (Field::File, _) if left || right => {
-                let n = self.usable_files().len().max(1);
-                let form = &mut self.form;
-                form.file = if right {
-                    (form.file + 1) % n
-                } else {
-                    (form.file + n - 1) % n
-                };
+                let usable = self.usable_files();
+                self.form.pick_next(&usable, right);
             }
             (Field::Sign, _) if toggle => {
                 if self.control.station.key.is_some() {
@@ -319,11 +519,6 @@ impl App {
                 }
             }
             _ => {}
-        }
-        // a change of mode can take away the field that had the focus
-        let fields = self.form.fields();
-        if !fields.contains(&self.form.field) {
-            self.form.field = Field::Mode;
         }
     }
 
@@ -352,6 +547,7 @@ struct Restore;
 
 impl Drop for Restore {
     fn drop(&mut self) {
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
         ratatui::restore();
     }
 }
@@ -363,29 +559,37 @@ pub fn run(control: Control, inbox: Inbox) -> Result<()> {
     control.listen(inbox);
     let colour = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
     let mut app = App::new(control, colour);
-    let mut terminal = ratatui::try_init()?;
+    // before init: it can switch raw mode on and then fail
     let _restore = Restore;
+    let mut terminal = ratatui::try_init()?;
+    execute!(io::stdout(), EnableBracketedPaste)?;
     loop {
         terminal.draw(|f| draw(f, &mut app))?;
         // the board changes on its own, so redraw a few times a second anyway
-        if event::poll(Duration::from_millis(200))?
-            && let Event::Key(k) = event::read()?
-            && k.kind == KeyEventKind::Press
-            && !app.key(k)
-        {
+        if !event::poll(Duration::from_millis(200))? {
+            continue;
+        }
+        let mut events = vec![event::read()?];
+        while event::poll(Duration::ZERO)? {
+            events.push(event::read()?);
+        }
+        if !app.events(events) {
             return Ok(());
         }
     }
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
-    app.wide = f.area().width >= WIDE;
     let area = f.area();
     let control = app.control.clone();
     // read before taking the board, so the listener never waits on the disk
     let history = control.history();
+    app.files = app.usable_files();
+    let form = app.form.height();
+    app.wide = area.width >= WIDE && area.height >= form + 11;
+    app.form_fits = app.wide || area.height >= form + 3;
     edit(&control.board, |board| {
-        if area.width >= WIDE {
+        if app.wide {
             let [head, main, bottom, foot] = Layout::vertical([
                 Constraint::Length(1),
                 Constraint::Fill(1),
@@ -476,9 +680,9 @@ fn tab_line(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn footer(f: &mut Frame, app: &App, area: Rect) {
-    let line = if app.confirm_quit {
+    let line = if let Some(ask) = app.confirm_quit {
         Line::styled(
-            " A delivery is on the air. Quit anyway? y/n",
+            format!(" {ask}"),
             app.fg(Color::Yellow).add_modifier(Modifier::BOLD),
         )
     } else if !app.status.is_empty() {
@@ -528,8 +732,29 @@ fn send_pane(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::bordered().title(" Send ");
     let inner = block.inner(area);
     f.render_widget(block, area);
+    if !app.form_fits {
+        let need = app.form.height() + 3;
+        f.render_widget(
+            Paragraph::new(format!(
+                "The terminal is too short for the send form: make it at least {need} rows."
+            ))
+            .wrap(Wrap { trim: true }),
+            inner,
+        );
+        return;
+    }
+    let own = app.control.station.call.to_string();
     let roster_hint = match &app.control.roster {
-        Some(r) => format!("blank for all: {}", r.calls().join(" ")),
+        Some(r) => {
+            let names: Vec<String> = r
+                .calls()
+                .into_iter()
+                .filter(|c| *c != own)
+                .chain(std::iter::once(r.net.to_string()))
+                .chain(r.groups.iter().map(|g| g.to_string()))
+                .collect();
+            format!("blank for all: {}", names.join(" "))
+        }
         None => "no roster; type callsigns".into(),
     };
     let mut rows = vec![];
@@ -578,16 +803,16 @@ fn send_pane(f: &mut Frame, app: &mut App, area: Rect) {
                     Source::Compose => "write one",
                     Source::Outbox => "from the outbox",
                 };
-                choice(app, field, "Message", source.into())
+                choice(app, field, "Source", source.into())
             }
             Field::File => {
-                let shown = match app.usable_files().get(app.form.file) {
-                    Some(f) => format!(
+                let shown = match app.form.picked(&app.files) {
+                    Ok(f) => format!(
                         "{}: {}",
                         f.file,
                         f.subject.as_deref().or(f.mid.as_deref()).unwrap_or("")
                     ),
-                    None => "No messages in the outbox yet.".into(),
+                    Err(why) => why,
                 };
                 choice(app, field, "File", shown)
             }
@@ -620,7 +845,6 @@ fn send_pane(f: &mut Frame, app: &mut App, area: Rect) {
                     Field::Subject => &mut app.form.subject,
                     _ => &mut app.form.body,
                 };
-                ta.set_cursor_line_style(Style::new());
                 ta.set_cursor_style(if focused {
                     Style::new().add_modifier(Modifier::REVERSED)
                 } else {
@@ -786,7 +1010,7 @@ fn history_pane(
         }
         for e in rows {
             lines.push(Line::raw(format!(
-                "  {}  {}  {}  {}",
+                "  {} UTC  {}  {}  {}",
                 message::date(e.unix),
                 e.mid,
                 e.mode,
@@ -800,12 +1024,15 @@ fn history_pane(
 mod tests {
     use super::*;
     use crate::control::Outbox;
-    use crate::control::{Incoming, Sending, edit};
+    use crate::control::{self, Sending, edit};
     use crate::frame::{Mode, Precedence};
+    use crate::message;
+    use crate::receiver::{Announced, Trust};
+    use crate::roster::Roster;
     use crate::station::{Radio, Station, Transport};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     fn control() -> Control {
         let radio = Radio {
@@ -935,20 +1162,18 @@ mod tests {
         let c = control();
         let long = "x".repeat(500);
         edit(&c.board, |b| {
-            for (id, subject) in [("00000001", "Net\u{1b}[2J news"), ("00000002", &long)] {
-                b.incoming.push(Incoming {
-                    id: id.into(),
+            for (id, subject) in [(1, "Net\u{1b}[2J news"), (2, long.as_str())] {
+                let a = Announced {
+                    id,
+                    mode: Mode::Bulletin,
+                    precedence: Precedence::Routine,
                     from: "K1ABC".into(),
                     mid: format!("MID{id}"),
-                    mode: "bulletin",
-                    precedence: "routine",
-                    trust: "unsigned",
-                    have: 3,
                     k: 3,
-                    status: "decoded",
-                    subject: Some(crate::control::clean(subject, 120)),
-                    note: None,
-                })
+                    trust: Trust::Unsigned,
+                };
+                control::announced(&mut b.incoming, &a);
+                control::decoded(&mut b.incoming, id, Some(subject.into()), None);
             }
         });
         let s = screen(&mut App::new(Arc::new(c), true), 120, 30);
@@ -1071,9 +1296,9 @@ mod tests {
         on_the_air(&c);
         let mut app = App::new(Arc::new(c), true);
         assert!(app.key(ctrl('c')));
-        assert!(app.confirm_quit);
+        assert!(app.confirm_quit.is_some());
         assert!(app.key(key(KeyCode::Char('n'))));
-        assert!(!app.confirm_quit);
+        assert!(app.confirm_quit.is_none());
         assert!(app.key(ctrl('c')));
         assert!(!app.key(key(KeyCode::Char('y'))));
     }
@@ -1083,7 +1308,245 @@ mod tests {
         let mut app = App::new(Arc::new(control()), true);
         assert!(app.key(key(KeyCode::Char('q'))));
         assert_eq!(app.form.to_send_form(&[]).to, vec!["q"]);
+        app.key(key(KeyCode::Backspace));
         focus(&mut app, Field::Mode);
         assert!(!app.key(key(KeyCode::Char('q'))));
+    }
+
+    fn with(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    fn release(c: char) -> KeyEvent {
+        KeyEvent::new_with_kind(KeyCode::Char(c), KeyModifiers::NONE, KeyEventKind::Release)
+    }
+
+    fn press(c: char) -> KeyEvent {
+        KeyEvent::new_with_kind(KeyCode::Char(c), KeyModifiers::NONE, KeyEventKind::Press)
+    }
+
+    fn outbox_with(files: &[(&str, &str)]) -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, subject) in files {
+            let (_, b2f) = message::compose("N0NCS", &["K1ABC".into()], subject, "body", 0);
+            std::fs::write(dir.path().join(name), b2f).unwrap();
+        }
+        let mut c = control();
+        c.outbox = Some(Outbox::new(dir.path().to_path_buf()));
+        let mut app = App::new(Arc::new(c), true);
+        type_in(&mut app, "K1ABC");
+        focus(&mut app, Field::Source);
+        app.key(key(KeyCode::Right));
+        (dir, app)
+    }
+
+    #[test]
+    fn ctrl_letters_work_with_caps_lock() {
+        let mut app = App::new(Arc::new(control()), true);
+        assert!(!app.key(with(KeyCode::Char('C'), KeyModifiers::CONTROL)));
+        let mut app = App::new(Arc::new(control()), true);
+        type_in(&mut app, "K1ABC");
+        app.key(with(KeyCode::Char('S'), KeyModifiers::CONTROL));
+        assert!(app.status.contains("needs a subject"), "{}", app.status);
+    }
+
+    #[test]
+    fn altgr_characters_are_typed() {
+        let mut app = App::new(Arc::new(control()), true);
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        app.key(with(KeyCode::Char('@'), altgr));
+        focus(&mut app, Field::Subject);
+        type_in(&mut app, "20");
+        app.key(with(KeyCode::Char('\u{20ac}'), altgr));
+        let f = app.form.to_send_form(&[]);
+        assert_eq!(f.to, vec!["@"]);
+        assert_eq!(f.subject, "20\u{20ac}");
+    }
+
+    #[test]
+    fn alt_code_characters_arrive_on_release() {
+        let mut app = App::new(Arc::new(control()), true);
+        assert!(app.event(Event::Key(press('5'))));
+        app.event(Event::Key(release('5')));
+        app.event(Event::Key(release('\u{b0}')));
+        app.event(Event::Key(press('\u{e9}')));
+        app.event(Event::Key(release('\u{e9}')));
+        assert_eq!(app.form.to_send_form(&[]).to, vec!["5\u{b0}\u{e9}"]);
+    }
+
+    #[test]
+    fn a_paste_goes_into_the_field_as_text() {
+        let mut app = App::new(Arc::new(control()), true);
+        app.event(Event::Paste("K1ABC\nW2XYZ".into()));
+        focus(&mut app, Field::Body);
+        assert!(app.event(Event::Paste("Need:\nwater\t20 cases\nquilts\t15".into())));
+        assert_eq!(app.form.field, Field::Body);
+        let f = app.form.to_send_form(&[]);
+        assert_eq!(f.to, vec!["K1ABC", "W2XYZ"]);
+        assert_eq!(f.body, "Need:\nwater 20 cases\nquilts 15");
+    }
+
+    #[test]
+    fn a_burst_of_keys_is_taken_as_a_paste() {
+        let burst: Vec<KeyEvent> = "water\t20\nq"
+            .chars()
+            .map(|c| match c {
+                '\t' => key(KeyCode::Tab),
+                '\n' => key(KeyCode::Enter),
+                c => key(KeyCode::Char(c)),
+            })
+            .collect();
+        assert_eq!(as_paste(&burst).as_deref(), Some("water\t20\nq"));
+        assert_eq!(as_paste(&burst[..2]), None);
+        let mut with_send = burst.clone();
+        with_send.push(ctrl('s'));
+        assert_eq!(as_paste(&with_send), None);
+    }
+
+    #[test]
+    fn quitting_with_an_unsent_message_asks_first() {
+        let mut app = App::new(Arc::new(control()), true);
+        type_in(&mut app, "K1ABC");
+        focus(&mut app, Field::Mode);
+        // recipients alone aren't a message
+        assert!(!app.key(key(KeyCode::Char('q'))));
+        let mut app = App::new(Arc::new(control()), true);
+        focus(&mut app, Field::Subject);
+        type_in(&mut app, "Sitrep");
+        focus(&mut app, Field::Mode);
+        assert!(app.key(key(KeyCode::Char('q'))));
+        assert!(app.confirm_quit.is_some());
+        let s = screen(&mut app, 120, 30);
+        assert!(s.contains("message you haven't sent"), "{s}");
+        assert!(!app.key(key(KeyCode::Char('Y'))));
+    }
+
+    #[test]
+    fn the_outbox_pick_follows_the_file_not_its_place() {
+        let (dir, mut app) = outbox_with(&[("b.b2f", "Bravo"), ("c.b2f", "Charlie")]);
+        focus(&mut app, Field::File);
+        app.key(key(KeyCode::Right));
+        let (_, b2f) = message::compose("N0NCS", &["K1ABC".into()], "Alpha", "body", 0);
+        std::fs::write(dir.path().join("a.b2f"), b2f).unwrap();
+        assert_eq!(
+            app.form.to_send_form(&app.usable_files()).file.as_deref(),
+            Some("c.b2f")
+        );
+        std::fs::remove_file(dir.path().join("c.b2f")).unwrap();
+        app.key(ctrl('s'));
+        assert!(app.status.contains("c.b2f"), "{}", app.status);
+        assert!(edit(&app.control.board, |b| b.sending.is_none()));
+    }
+
+    #[test]
+    fn sending_from_an_empty_outbox_says_pick_one() {
+        let (_dir, mut app) = outbox_with(&[]);
+        app.key(ctrl('s'));
+        assert!(app.status.contains("Pick a message"), "{}", app.status);
+    }
+
+    #[test]
+    fn a_short_wide_terminal_still_shows_every_field() {
+        let (_dir, mut app) = outbox_with(&[("b.b2f", "Bravo")]);
+        focus(&mut app, Field::Mode);
+        app.key(key(KeyCode::Right));
+        let s = screen(&mut app, 120, 20);
+        for want in ["Repeats", "Source", "File", "Sign"] {
+            assert!(s.contains(want), "{want:?} missing from\n{s}");
+        }
+        focus(&mut app, Field::Sign);
+        let s = screen(&mut app, 120, 9);
+        assert!(s.contains("too short"), "{s}");
+        app.key(key(KeyCode::Char(' ')));
+        assert!(!app.form.sign);
+    }
+
+    #[test]
+    fn a_send_says_where_it_went_and_clears_the_text() {
+        let mut app = App::new(Arc::new(control()), true);
+        type_in(&mut app, "K1ABC");
+        focus(&mut app, Field::Subject);
+        type_in(&mut app, "Sitrep");
+        focus(&mut app, Field::Body);
+        type_in(&mut app, "all ok");
+        app.key(ctrl('s'));
+        assert!(app.status.contains("Sending to K1ABC"), "{}", app.status);
+        let f = app.form.to_send_form(&[]);
+        assert_eq!((f.subject.as_str(), f.body.as_str()), ("", ""));
+        assert_eq!(f.to, vec!["K1ABC"]);
+    }
+
+    #[test]
+    fn an_outbox_send_keeps_what_was_written() {
+        let (_dir, mut app) = outbox_with(&[("b.b2f", "Bravo")]);
+        focus(&mut app, Field::Source);
+        app.key(key(KeyCode::Right));
+        focus(&mut app, Field::Subject);
+        type_in(&mut app, "Draft");
+        focus(&mut app, Field::Source);
+        app.key(key(KeyCode::Right));
+        app.key(ctrl('s'));
+        assert!(app.status.contains("Sending"), "{}", app.status);
+        focus(&mut app, Field::Source);
+        app.key(key(KeyCode::Right));
+        assert_eq!(app.form.to_send_form(&[]).subject, "Draft");
+    }
+
+    #[test]
+    fn ack_takes_away_repeats_and_leaving_emergency_clears_it() {
+        let mut app = App::new(Arc::new(control()), true);
+        focus(&mut app, Field::Mode);
+        app.key(key(KeyCode::Left));
+        assert!(app.form.fields().contains(&Field::Repeat));
+        focus(&mut app, Field::Ack);
+        app.key(key(KeyCode::Char(' ')));
+        assert!(!app.form.fields().contains(&Field::Repeat));
+        focus(&mut app, Field::Mode);
+        app.key(key(KeyCode::Left));
+        app.key(key(KeyCode::Right));
+        assert!(!app.form.to_send_form(&[]).ack);
+    }
+
+    #[test]
+    fn interval_shows_only_with_repeats() {
+        let mut app = App::new(Arc::new(control()), true);
+        focus(&mut app, Field::Mode);
+        app.key(key(KeyCode::Right));
+        assert!(!app.form.fields().contains(&Field::Interval));
+        focus(&mut app, Field::Repeat);
+        app.key(key(KeyCode::Up));
+        assert!(app.form.fields().contains(&Field::Interval));
+    }
+
+    #[test]
+    fn the_to_hint_lists_the_others_and_the_groups() {
+        let mut roster = Roster::new(&"NET1".parse().unwrap());
+        for c in ["N0NCS", "K1ABC"] {
+            roster.add_member(&c.parse().unwrap(), None).unwrap();
+        }
+        let mut c = control();
+        c.roster = Some(roster);
+        let s = screen(&mut App::new(Arc::new(c), true), 120, 30);
+        let hint = s.lines().find(|l| l.contains("blank for all")).unwrap();
+        assert!(hint.contains("K1ABC") && hint.contains("NET1"), "{hint}");
+        assert!(!hint.contains("N0NCS"), "{hint}");
+    }
+
+    #[test]
+    fn no_colour_means_no_colour_at_all() {
+        let mut app = App::new(Arc::new(control()), false);
+        type_in(&mut app, "K1ABC");
+        for _ in 0..3 {
+            app.key(with(KeyCode::Left, KeyModifiers::SHIFT));
+        }
+        let mut t = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        t.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = t.backend().buffer();
+        assert!(
+            buf.content()
+                .iter()
+                .all(|c| c.fg == ratatui::style::Color::Reset
+                    && c.bg == ratatui::style::Color::Reset)
+        );
     }
 }
