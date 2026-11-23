@@ -8,11 +8,18 @@ what appears on its GitHub release page. Validated in CI by
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-23
+
 ### Added
 
 - `netcast tui`: a terminal screen for net control, with the send form, each station's state
   through the rounds, incoming deliveries, the log and recent history. It works over SSH and
   follows the terminal's colours.
+
+### Fixed
+
+- The outbox list on the web page reads a file that isn't a usable message again only when the
+  file changes, instead of every second.
 
 ## [0.2.0] - 2026-11-19
 
@@ -76,6 +83,7 @@ what appears on its GitHub release page. Validated in CI by
 - The web page shows recent sent and received deliveries, and takes the gap between bulletin
   repeats.
 
-[Unreleased]: https://github.com/Londopy/netcast/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Londopy/netcast/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Londopy/netcast/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Londopy/netcast/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Londopy/netcast/releases/tag/v0.1.0
