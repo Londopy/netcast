@@ -67,8 +67,8 @@ timers. Run `netcast sim --help` to try other nets.
 - Decoded messages land in Pat's inbox as ordinary `.b2f` files, so they show up in Pat with no
   change to Pat
 - Addressed, bulletin and emergency modes, and a radiogram-style precedence (routine, welfare, priority, emergency) on every message
-- A web page on the station for composing, picking recipients from the roster, and watching
-  each station's state live
+- A web page and a terminal screen on the station for composing, picking recipients from the
+  roster, and watching each station's state live
 - A net roster file that net control shares ahead of time, with members, groups and keys
 - Optional Ed25519 signatures, so stations can tell a message really came from net control
 - Works over Direwolf's KISS port, using plain AX.25 UI frames at 1200 or 9600 baud, and over
@@ -126,7 +126,8 @@ everyday commands also print a one-line notice when a newer release exists, chec
 most once a day; set `NETCAST_NO_UPDATE_CHECK=1` to turn that off. The new version is test-run
 before it replaces the old one, so a download that won't start here changes nothing. An
 all-users install in Program Files can't replace itself: run the new installer instead. A
-listener or web page that's already running keeps the old version until you restart it.
+listener, web page or terminal screen that's already running keeps the old version until you
+restart it.
 
 Every station on a net needs a release that speaks the same protocol version. 0.2.0 speaks
 version 2 and 0.1.0 spoke version 1, so a net has to upgrade together. A 0.1.0 station hears
@@ -328,6 +329,27 @@ The page only answers on 127.0.0.1. It can make the radio transmit, so it refuse
 that don't name it as the host, and every request that sends must carry a token that only the
 page itself knows. Another website open in the same browser can't send through it.
 
+## The terminal screen
+
+```text
+netcast tui --call N0NCS --roster net1.londopy --outbox C:\netcast\outbox
+```
+
+The same as the web page, in the terminal: useful over SSH to the Raspberry Pi next to the
+radio, or anywhere without a browser. It takes the same options as `netcast ui` except the
+port, and runs the listener too.
+
+| Key | What it does |
+|---|---|
+| Tab, Shift+Tab | next and previous field |
+| Left, Right | change the mode, precedence, message source or outbox file; tick a box |
+| Up, Down | change the number of repeats and the minutes between them |
+| Ctrl+S | send |
+| F1 to F4 | in a terminal under 100 columns, show Send, On the air, Incoming or Log |
+| q, Ctrl+C | quit; q types a letter while a text field has the cursor. Quitting while a delivery is on the air asks first, since it stops the delivery |
+
+It uses the terminal's own colours, and none at all when `NO_COLOR` is set.
+
 ## Which mode to use
 
 | Traffic | Mode | Acknowledged |
@@ -407,8 +429,10 @@ src/
   pat.rs        Pat mailbox lookup and inbox writes
   message.rs    B2F parsing and composing
   history.rs    the sent and received logs
-  station.rs    sending and listening, shared by the CLI and the web page
+  station.rs    sending and listening, shared by the CLI and the screens
+  control.rs    net control's board and send form, shared by the web page and the TUI
   ui.rs         the web page's server and API
+  tui.rs        the terminal screen
   keys.rs       the station key and announcement signatures
   roster.rs     the net roster
   londopy.rs    reading and writing .londopy files

@@ -8,6 +8,12 @@ what appears on its GitHub release page. Validated in CI by
 
 ## [Unreleased]
 
+### Added
+
+- `netcast tui`: a terminal screen for net control, with the send form, each station's state
+  through the rounds, incoming deliveries, the log and recent history. It works over SSH and
+  follows the terminal's colours.
+
 ## [0.2.0] - 2026-11-19
 
 ### Changed
