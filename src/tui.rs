@@ -1,5 +1,8 @@
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Result;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -7,13 +10,14 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Row, Table};
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui_textarea::TextArea;
 
 use crate::control::{Board, Control, OutboxFile, Refused, SendForm, Sending, edit};
 use crate::frame::{Mode, Precedence};
 use crate::history::Entry;
 use crate::message;
+use crate::station::Inbox;
 
 // below this many columns the panes don't fit side by side
 const WIDE: u16 = 100;
@@ -343,7 +347,39 @@ impl App {
     }
 }
 
+/// Puts the terminal back however `run` ends.
+struct Restore;
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        ratatui::restore();
+    }
+}
+
+/// `netcast tui`: the listener plus a terminal screen, until the user quits.
+pub fn run(control: Control, inbox: Inbox) -> Result<()> {
+    let control = Arc::new(control);
+    edit(&control.board, |b| b.quiet = true);
+    control.listen(inbox);
+    let colour = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
+    let mut app = App::new(control, colour);
+    let mut terminal = ratatui::try_init()?;
+    let _restore = Restore;
+    loop {
+        terminal.draw(|f| draw(f, &mut app))?;
+        // the board changes on its own, so redraw a few times a second anyway
+        if event::poll(Duration::from_millis(200))?
+            && let Event::Key(k) = event::read()?
+            && k.kind == KeyEventKind::Press
+            && !app.key(k)
+        {
+            return Ok(());
+        }
+    }
+}
+
 pub fn draw(f: &mut Frame, app: &mut App) {
+    app.wide = f.area().width >= WIDE;
     let area = f.area();
     let control = app.control.clone();
     // read before taking the board, so the listener never waits on the disk
@@ -405,13 +441,24 @@ fn header(f: &mut Frame, app: &App, board: &Board, area: Rect) {
     } else {
         app.fg(Color::Red)
     };
-    let [left, right] =
-        Layout::horizontal([Constraint::Fill(1), Constraint::Length(tnc.len() as u16)]).areas(area);
+    // the station's name always shows; a long TNC error is cut short instead
+    let [left, right] = Layout::horizontal([
+        Constraint::Length(who.chars().count() as u16 + 2),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
     f.render_widget(
         Line::styled(who, Style::new().add_modifier(Modifier::BOLD)),
         left,
     );
-    f.render_widget(Line::styled(tnc, tnc_style), right);
+    let room = right.width as usize;
+    let tnc = if tnc.chars().count() > room {
+        let cut: String = tnc.chars().take(room.saturating_sub(4)).collect();
+        format!("{cut}... ")
+    } else {
+        tnc
+    };
+    f.render_widget(Line::styled(tnc, tnc_style).right_aligned(), right);
 }
 
 fn tab_line(f: &mut Frame, app: &App, area: Rect) {
@@ -482,8 +529,8 @@ fn send_pane(f: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     let roster_hint = match &app.control.roster {
-        Some(r) => format!("Empty sends to every member: {}", r.calls().join(" ")),
-        None => "No roster loaded, so type the callsigns.".into(),
+        Some(r) => format!("blank for all: {}", r.calls().join(" ")),
+        None => "no roster; type callsigns".into(),
     };
     let mut rows = vec![];
     for field in app.form.fields() {
@@ -860,6 +907,21 @@ mod tests {
     }
 
     #[test]
+    fn a_long_tnc_error_leaves_the_station_name() {
+        let c = control();
+        edit(&c.board, |b| {
+            b.tnc = format!(
+                "can't reach the KISS port at 127.0.0.1:1: {}",
+                "refused ".repeat(20)
+            )
+        });
+        let s = screen(&mut App::new(Arc::new(c), true), 100, 30);
+        let top = s.lines().next().unwrap();
+        assert!(top.contains("N0NCS on NET1"), "{top}");
+        assert!(top.contains("can't reach the KISS port"), "{top}");
+    }
+
+    #[test]
     fn tiny_terminal_does_not_panic() {
         let c = control();
         on_the_air(&c);
@@ -989,7 +1051,7 @@ mod tests {
 
     #[test]
     fn outbox_source_without_files_says_so() {
-        let mut app = App::new(Arc::new(control()), true);
+        let app = App::new(Arc::new(control()), true);
         assert!(!app.form.fields().contains(&Field::Source));
 
         let dir = tempfile::tempdir().unwrap();

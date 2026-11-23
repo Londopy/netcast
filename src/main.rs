@@ -99,6 +99,16 @@ enum Cmd {
         #[command(flatten)]
         radio: RadioArgs,
     },
+    /// Run the listener and a terminal screen for sending and watching deliveries.
+    Tui {
+        #[command(flatten)]
+        inbox: InboxArgs,
+        /// A folder of .b2f messages the screen can send.
+        #[arg(long)]
+        outbox: Option<PathBuf>,
+        #[command(flatten)]
+        radio: RadioArgs,
+    },
     /// Run the listener and a web page for sending and watching deliveries.
     Ui {
         #[command(flatten)]
@@ -326,7 +336,7 @@ fn run(cli: Cli) -> Result<bool> {
     // the long-running commands, where the background check has time to finish
     if matches!(
         cli.cmd,
-        Cmd::Listen { .. } | Cmd::Send { .. } | Cmd::Ui { .. }
+        Cmd::Listen { .. } | Cmd::Send { .. } | Cmd::Ui { .. } | Cmd::Tui { .. }
     ) {
         upgrade::notice(&history::default_dir(), unix_now());
     }
@@ -386,6 +396,18 @@ fn run(cli: Cli) -> Result<bool> {
                 );
                 return Ok(false);
             }
+            Ok(true)
+        }
+        Cmd::Tui {
+            inbox,
+            outbox,
+            radio,
+        } => {
+            let roster = load_roster(inbox.roster.as_deref())?;
+            let call = first_call(&inbox)?;
+            let st = station(call, radio, roster.as_ref())?;
+            let inbox = inbox_for(inbox, &st, roster.as_ref())?;
+            tui::run(control::Control::new(st, roster, outbox), inbox)?;
             Ok(true)
         }
         Cmd::Ui {

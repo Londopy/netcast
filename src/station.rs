@@ -400,15 +400,26 @@ struct Listener {
 }
 
 impl Listener {
+    /// Whether lines go to the console too: not when a screen owns the terminal.
+    fn echoes(&self) -> bool {
+        self.board
+            .as_ref()
+            .is_none_or(|b| !control::edit(b, |b| b.quiet))
+    }
+
     fn say(&self, line: String) {
-        println!("{line}");
+        if self.echoes() {
+            println!("{line}");
+        }
         if let Some(b) = &self.board {
             control::edit(b, |b| b.log(line));
         }
     }
 
     fn warn(&self, line: String) {
-        eprintln!("{line}");
+        if self.echoes() {
+            eprintln!("{line}");
+        }
         if let Some(b) = &self.board {
             control::edit(b, |b| b.log(line));
         }
@@ -632,6 +643,23 @@ mod tests {
         let o = Outgoing::new(vec![], vec![], Mode::Addressed, false).unwrap();
         assert_eq!(o.precedence, Precedence::Routine);
         assert!(Outgoing::new(vec![], vec![], Mode::Bulletin, true).is_err());
+    }
+
+    #[test]
+    fn a_quiet_board_keeps_the_listener_off_the_console() {
+        let listener = |board: Option<Shared>| Listener {
+            rx: Receiver::new(vec!["K1ABC".into()], vec![]),
+            due: vec![],
+            mailbox: PathBuf::new(),
+            dir: PathBuf::new(),
+            board,
+            other_versions: BTreeSet::new(),
+        };
+        assert!(listener(None).echoes());
+        let board = Shared::default();
+        assert!(listener(Some(board.clone())).echoes());
+        control::edit(&board, |b| b.quiet = true);
+        assert!(!listener(Some(board)).echoes());
     }
 
     #[test]

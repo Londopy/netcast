@@ -31,6 +31,9 @@ pub struct Board {
     pub incoming: Vec<Incoming>,
     pub sending: Option<Sending>,
     pub log: VecDeque<String>,
+    /// Set when a terminal screen shows the board, so nothing else prints over it.
+    #[serde(skip)]
+    pub quiet: bool,
 }
 
 pub type Shared = Arc<Mutex<Board>>;
