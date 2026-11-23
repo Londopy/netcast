@@ -1,6 +1,7 @@
 mod ardop;
 mod ax25;
 mod codec;
+mod control;
 mod frame;
 mod history;
 mod keys;
@@ -396,7 +397,7 @@ fn run(cli: Cli) -> Result<bool> {
             let call = first_call(&inbox)?;
             let st = station(call, radio, roster.as_ref())?;
             let inbox = inbox_for(inbox, &st, roster.as_ref())?;
-            ui::Ui::new(st, roster, outbox, port).run(inbox)?;
+            ui::Ui::new(control::Control::new(st, roster, outbox), port).run(inbox)?;
             Ok(true)
         }
         Cmd::Check {

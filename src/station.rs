@@ -12,6 +12,7 @@ use rand::RngExt;
 
 use crate::ardop::{self, ArdopLink, FecMode};
 use crate::ax25::Addr;
+use crate::control::{self, Incoming, Shared};
 use crate::frame::{Frame, Mode, Precedence, VERSION};
 use crate::kiss::KissLink;
 use crate::link::{Channel, Link};
@@ -19,7 +20,6 @@ use crate::pat::Stored;
 use crate::receiver::{Output, Receiver, Trust};
 use crate::roster::Roster;
 use crate::sender::{self, Delivery, Envelope, Plan, Progress, State};
-use crate::ui::{self, Incoming, Shared};
 use crate::{history, message, pat};
 
 // a full AX.25 info field
@@ -403,14 +403,14 @@ impl Listener {
     fn say(&self, line: String) {
         println!("{line}");
         if let Some(b) = &self.board {
-            ui::edit(b, |b| b.log(line));
+            control::edit(b, |b| b.log(line));
         }
     }
 
     fn warn(&self, line: String) {
         eprintln!("{line}");
         if let Some(b) = &self.board {
-            ui::edit(b, |b| b.log(line));
+            control::edit(b, |b| b.log(line));
         }
     }
 
@@ -421,13 +421,13 @@ impl Listener {
             self.warn(line.clone());
         }
         if let Some(b) = &self.board {
-            ui::edit(b, |b| b.tnc = line);
+            control::edit(b, |b| b.tnc = line);
         }
     }
 
     fn update(&self, f: impl FnOnce(&mut Vec<Incoming>)) {
         if let Some(b) = &self.board {
-            ui::edit(b, |b| f(&mut b.incoming));
+            control::edit(b, |b| f(&mut b.incoming));
         }
     }
 
@@ -462,7 +462,7 @@ impl Listener {
                     self.on_output(out, now);
                 }
                 if let Some((have, k)) = self.rx.progress(id) {
-                    self.update(|inc| ui::progress(inc, id, have, k));
+                    self.update(|inc| control::progress(inc, id, have, k));
                 }
             }
             let now = link.now_ms();
@@ -510,7 +510,7 @@ impl Listener {
                     a.trust.name(),
                     a.k
                 ));
-                self.update(|inc| ui::announced(inc, &a));
+                self.update(|inc| control::announced(inc, &a));
             }
             Output::Report { at_ms, frame } => self.due.push((at_ms, frame)),
             Output::Decoded(d) => {
@@ -542,7 +542,7 @@ impl Listener {
                     if let Some(why) = problem {
                         // not stored means not decoded: receive it again rather than ack it
                         self.warn(why.clone());
-                        self.update(|inc| ui::failed(inc, d.id, &why));
+                        self.update(|inc| control::failed(inc, d.id, &why));
                         self.rx.forget(d.id);
                         return;
                     }
@@ -552,7 +552,7 @@ impl Listener {
                     (!call.eq_ignore_ascii_case(&d.from)).then(|| {
                         format!(
                             "the message says it's from {}, but {} sent it",
-                            ui::clean(&claimed, 60),
+                            control::clean(&claimed, 60),
                             d.from
                         )
                     })
@@ -561,7 +561,7 @@ impl Listener {
                     self.say(format!("{}: {n}", d.mid));
                 }
                 let subject = message::header(&d.b2f, "subject");
-                self.update(|inc| ui::decoded(inc, d.id, subject, note));
+                self.update(|inc| control::decoded(inc, d.id, subject, note));
                 let r = history::Received {
                     id: d.id,
                     expires_unix: unix_now() + d.expires_ms.saturating_sub(now) / 1000,
@@ -584,7 +584,7 @@ impl Listener {
             }
             Output::Failed { id, why } => {
                 self.say(format!("delivery {id:08x}: {why}"));
-                self.update(|inc| ui::failed(inc, id, &why));
+                self.update(|inc| control::failed(inc, id, &why));
             }
         }
     }
@@ -655,7 +655,7 @@ mod tests {
         old[2] = VERSION - 1;
         l.check_version(&old);
         l.check_version(&old);
-        let said = ui::edit(&board, |b| {
+        let said = control::edit(&board, |b| {
             b.log
                 .iter()
                 .filter(|l| l.contains("protocol version"))
