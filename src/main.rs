@@ -15,6 +15,7 @@ mod roster;
 mod sender;
 mod sim;
 mod station;
+mod tui;
 mod ui;
 mod upgrade;
 
